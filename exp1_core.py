@@ -119,19 +119,26 @@ def _regression_uncertainty(regressor, x):
     We sample every Nth tree and accumulate first/second moments. This is not a
     formal predictive interval; it is an ensemble-disagreement feature used only
     as an execution filter/ranking input.
+
+    Individual ExtraTreeRegressor estimators are fitted internally on NumPy
+    arrays by scikit-learn even when the parent ensemble receives a DataFrame.
+    Passing a NumPy view here therefore avoids misleading feature-name warnings
+    without changing the values or the model's predictions.
     """
-    total = np.zeros(len(x), dtype=float)
-    total_sq = np.zeros(len(x), dtype=float)
+    x_array = x.to_numpy(dtype=float, copy=False) if hasattr(x, "to_numpy") else np.asarray(x)
+
+    total = np.zeros(len(x_array), dtype=float)
+    total_sq = np.zeros(len(x_array), dtype=float)
     count = 0
 
     for tree in regressor.estimators_[::UNCERTAINTY_TREE_STRIDE]:
-        prediction = tree.predict(x)
+        prediction = tree.predict(x_array)
         total += prediction
         total_sq += prediction * prediction
         count += 1
 
     if count == 0:
-        return np.zeros(len(x), dtype=float)
+        return np.zeros(len(x_array), dtype=float)
 
     mean = total / count
     variance = np.maximum(total_sq / count - mean * mean, 0.0)
