@@ -14,7 +14,7 @@ import yfinance as yf
 # ==========================================
 
 SYMBOLS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
-INTERVAL = "15m"
+INTERVAL = "5m"
 PERIOD = "60d"
 POLL_SECONDS = 60
 
@@ -23,11 +23,11 @@ COMMISSION_RATE = 0.001      # 0.10%
 SLIPPAGE_RATE = 0.0005       # 0.05%
 
 # Risk controls
-POSITION_SIZE_PERCENT = 0.20     # at most 20% of portfolio per new position
+POSITION_SIZE_PERCENT = 0.20
 MAX_OPEN_POSITIONS = 3
-STOP_LOSS_PERCENT = 0.05         # 5% below entry
+STOP_LOSS_PERCENT = 0.05
 
-STATE_FILE = Path("paper_state_15m.json")
+STATE_FILE = Path("paper_state_5m.json")
 LOG_DIR = Path("logs")
 LOG_FILE = LOG_DIR / "paper_trader.log"
 TRADE_CSV = LOG_DIR / "trades.csv"
@@ -41,7 +41,6 @@ EQUITY_CSV = LOG_DIR / "equity.csv"
 
 def setup_logging():
     LOG_DIR.mkdir(exist_ok=True)
-
     logging.basicConfig(
         filename=LOG_FILE,
         level=logging.INFO,
@@ -80,7 +79,7 @@ def download_data(symbol):
 
 
 def completed_bars(data):
-    # The newest Yahoo row may still be forming, so never use it for signals.
+    # The newest Yahoo candle may still be forming.
     return data.iloc[:-1].copy()
 
 
@@ -103,15 +102,11 @@ def calculate_rsi(series, period=2):
 
 def add_indicators(data):
     data = data.copy()
-
     data["MA50"] = data["Close"].rolling(50).mean()
     data["MA200"] = data["Close"].rolling(200).mean()
-
     data["High20"] = data["High"].rolling(20).max().shift(1)
     data["Low10"] = data["Low"].rolling(10).min().shift(1)
-
     data["RSI2"] = calculate_rsi(data["Close"], 2)
-
     return data
 
 
@@ -121,20 +116,6 @@ def add_indicators(data):
 
 
 def strategy_signal(data, has_position):
-    """
-    One combined strategy for the live paper portfolio.
-
-    BUY requires either:
-    - a 20-bar breakout, or
-    - RSI(2) oversold while price is above MA200.
-
-    SELL requires either:
-    - a 10-bar downside breakout, or
-    - RSI(2) mean-reversion exit.
-
-    MA200 acts as a long-term trend filter.
-    """
-
     latest = data.iloc[-1]
 
     if pd.isna(latest["MA200"]):
@@ -147,7 +128,6 @@ def strategy_signal(data, has_position):
             not pd.isna(latest["High20"])
             and latest["Close"] > latest["High20"]
         )
-
         mean_reversion_buy = trend_up and latest["RSI2"] < 10
 
         if breakout_buy or mean_reversion_buy:
@@ -158,7 +138,6 @@ def strategy_signal(data, has_position):
             not pd.isna(latest["Low10"])
             and latest["Close"] < latest["Low10"]
         )
-
         mean_reversion_sell = latest["RSI2"] > 70
 
         if breakout_sell or mean_reversion_sell:
@@ -191,10 +170,7 @@ def fresh_state():
         "starting_cash": STARTING_CASH,
         "cash": STARTING_CASH,
         "realized_pnl": 0.0,
-        "positions": {
-            symbol: fresh_position()
-            for symbol in SYMBOLS
-        },
+        "positions": {symbol: fresh_position() for symbol in SYMBOLS},
         "trades": [],
     }
 
@@ -206,14 +182,11 @@ def load_state():
     with STATE_FILE.open("r", encoding="utf-8") as file:
         state = json.load(file)
 
-    if state.get("interval") != INTERVAL:
-        raise ValueError(
-            f"{STATE_FILE} belongs to another interval. "
-            "Delete it to start a fresh account."
-        )
+    required_keys = {"cash", "realized_pnl", "positions", "trades"}
+    if state.get("interval") != INTERVAL or not required_keys.issubset(state):
+        log_event("Old or incompatible paper state detected; starting fresh")
+        return fresh_state()
 
-    # Add any newly configured symbols without breaking old state.
-    state.setdefault("positions", {})
     for symbol in SYMBOLS:
         state["positions"].setdefault(symbol, fresh_position())
 
@@ -252,7 +225,7 @@ def unrealized_pnl(state, latest_prices):
     total = 0.0
 
     for symbol, position in state["positions"].items():
-        if position["shares"] == 0 or symbol not in latest_prices:
+        if position["shares"] <= 0 or symbol not in latest_prices:
             continue
 
         current_value = position["shares"] * latest_prices[symbol]
@@ -262,49 +235,8 @@ def unrealized_pnl(state, latest_prices):
 
 
 # ==========================================
-# SECTION 8 — ORDER EXECUTION
+# SECTION 8 — TRADE RECORDING
 # ==========================================
-
-
-def execute_buy(state, symbol, execution_time, market_open, current_portfolio_value):
-    position = state["positions"][symbol]
-
-    if position["shares"] > 0:
-        return None
-
-    if open_position_count(state) >= MAX_OPEN_POSITIONS:
-        log_event(f"BUY BLOCKED {symbol}: max open positions reached")
-        return None
-
-    max_allocation = current_portfolio_value * POSITION_SIZE_PERCENT
-    available_for_trade = min(state["cash"], max_allocation)
-
-    if available_for_trade <= 0:
-        log_event(f"BUY BLOCKED {symbol}: no available cash")
-        return None
-
-    execution_price = market_open * (1 + SLIPPAGE_RATE)
-
-    trade_value = available_for_trade / (1 + COMMISSION_RATE)
-    commission = trade_value * COMMISSION_RATE
-    shares = trade_value / execution_price
-    total_cost = trade_value + commission
-
-    state["cash"] -= total_cost
-
-    position["shares"] = shares
-    position["entry_price"] = execution_price
-    position["entry_time"] = execution_time
-    position["entry_total_cost"] = total_cost
-    position["stop_price"] = execution_price * (1 - STOP_LOSS_PERCENT)
-    position["pending_order"] = None
-
-    log_event(
-        f"BUY {symbol} shares={shares:.6f} price={execution_price:.4f} "
-        f"cost={total_cost:.2f} commission={commission:.2f}"
-    )
-
-    return execution_price
 
 
 def record_trade(state, symbol, execution_time, execution_price, pnl, return_percent, reason):
@@ -324,24 +256,63 @@ def record_trade(state, symbol, execution_time, execution_price, pnl, return_per
     state["trades"].append(trade)
 
     file_exists = TRADE_CSV.exists()
-
     with TRADE_CSV.open("a", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=trade.keys())
-
         if not file_exists:
             writer.writeheader()
-
         writer.writerow(trade)
+
+
+# ==========================================
+# SECTION 9 — ORDER EXECUTION
+# ==========================================
+
+
+def execute_buy(state, symbol, execution_time, market_open, current_portfolio_value):
+    position = state["positions"][symbol]
+
+    if position["shares"] > 0:
+        return
+
+    if open_position_count(state) >= MAX_OPEN_POSITIONS:
+        log_event(f"BUY BLOCKED {symbol}: max open positions reached")
+        return
+
+    max_allocation = current_portfolio_value * POSITION_SIZE_PERCENT
+    available_for_trade = min(state["cash"], max_allocation)
+
+    if available_for_trade <= 0:
+        log_event(f"BUY BLOCKED {symbol}: no available cash")
+        return
+
+    execution_price = market_open * (1 + SLIPPAGE_RATE)
+    trade_value = available_for_trade / (1 + COMMISSION_RATE)
+    commission = trade_value * COMMISSION_RATE
+    shares = trade_value / execution_price
+    total_cost = trade_value + commission
+
+    state["cash"] -= total_cost
+
+    position["shares"] = shares
+    position["entry_price"] = execution_price
+    position["entry_time"] = execution_time
+    position["entry_total_cost"] = total_cost
+    position["stop_price"] = execution_price * (1 - STOP_LOSS_PERCENT)
+    position["pending_order"] = None
+
+    log_event(
+        f"BUY {symbol} shares={shares:.6f} price={execution_price:.4f} "
+        f"cost={total_cost:.2f} commission={commission:.2f}"
+    )
 
 
 def execute_sell(state, symbol, execution_time, market_price, reason):
     position = state["positions"][symbol]
 
     if position["shares"] <= 0:
-        return None
+        return
 
     execution_price = market_price * (1 - SLIPPAGE_RATE)
-
     gross_value = position["shares"] * execution_price
     commission = gross_value * COMMISSION_RATE
     net_value = gross_value - commission
@@ -369,11 +340,9 @@ def execute_sell(state, symbol, execution_time, market_price, reason):
 
     state["positions"][symbol] = fresh_position()
 
-    return execution_price, pnl
-
 
 # ==========================================
-# SECTION 9 — SIGNAL / ORDER PROCESSING
+# SECTION 10 — SIGNAL / ORDER PROCESSING
 # ==========================================
 
 
@@ -406,17 +375,10 @@ def try_execute_pending_order(state, symbol, raw_data, latest_prices):
             market_open,
             portfolio_value(state, latest_prices),
         )
-
     elif pending["side"] == "SELL":
-        execute_sell(
-            state,
-            symbol,
-            execution_time,
-            market_open,
-            "signal",
-        )
+        execute_sell(state, symbol, execution_time, market_open, "signal")
 
-    position["pending_order"] = None
+    state["positions"][symbol]["pending_order"] = None
 
 
 def process_stop_loss(state, symbol, latest_price, timestamp):
@@ -426,29 +388,17 @@ def process_stop_loss(state, symbol, latest_price, timestamp):
         return
 
     if latest_price <= position["stop_price"]:
-        execute_sell(
-            state,
-            symbol,
-            timestamp,
-            latest_price,
-            "stop_loss",
-        )
+        execute_sell(state, symbol, timestamp, latest_price, "stop_loss")
 
 
 def process_signal(state, symbol, completed):
     position = state["positions"][symbol]
-
-    signal_timestamp = completed.index[-1]
-    signal_time = timestamp_text(signal_timestamp)
+    signal_time = timestamp_text(completed.index[-1])
 
     if position["last_signal_bar"] == signal_time:
         return
 
-    signal = strategy_signal(
-        completed,
-        position["shares"] > 0,
-    )
-
+    signal = strategy_signal(completed, position["shares"] > 0)
     position["last_signal_bar"] = signal_time
 
     log_event(
@@ -464,36 +414,30 @@ def process_signal(state, symbol, completed):
 
 
 # ==========================================
-# SECTION 10 — CSV EQUITY HISTORY
+# SECTION 11 — EQUITY HISTORY
 # ==========================================
 
 
 def save_equity_snapshot(state, latest_prices):
-    value = portfolio_value(state, latest_prices)
-    unrealized = unrealized_pnl(state, latest_prices)
-
     row = {
         "timestamp": datetime.now().isoformat(),
         "cash": state["cash"],
-        "portfolio_value": value,
+        "portfolio_value": portfolio_value(state, latest_prices),
         "realized_pnl": state["realized_pnl"],
-        "unrealized_pnl": unrealized,
+        "unrealized_pnl": unrealized_pnl(state, latest_prices),
         "open_positions": open_position_count(state),
     }
 
     file_exists = EQUITY_CSV.exists()
-
     with EQUITY_CSV.open("a", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=row.keys())
-
         if not file_exists:
             writer.writeheader()
-
         writer.writerow(row)
 
 
 # ==========================================
-# SECTION 11 — CLEAN TERMINAL OUTPUT
+# SECTION 12 — CLEAN TERMINAL OUTPUT
 # ==========================================
 
 
@@ -504,7 +448,7 @@ def print_money_summary(state, latest_prices):
     unrealized = unrealized_pnl(state, latest_prices)
 
     print("\033[2J\033[H", end="")
-    print("PAPER PORTFOLIO")
+    print("PAPER PORTFOLIO — 5 MIN")
     print("=" * 40)
     print(f"Account value:   ${value:,.2f}")
     print(f"Cash:            ${state['cash']:,.2f}")
@@ -520,32 +464,26 @@ def print_money_summary(state, latest_prices):
     print("-" * 40)
 
     any_position = False
-
     for symbol in SYMBOLS:
         position = state["positions"][symbol]
-
         if position["shares"] <= 0 or symbol not in latest_prices:
             continue
 
         any_position = True
         market_value = position["shares"] * latest_prices[symbol]
         pnl = market_value - position["entry_total_cost"]
-
-        print(
-            f"{symbol:<6} ${market_value:>9,.2f}  "
-            f"P/L ${pnl:+8,.2f}"
-        )
+        print(f"{symbol:<6} ${market_value:>9,.2f}  P/L ${pnl:+8,.2f}")
 
     if not any_position:
         print("None")
 
     print()
-    print("Updates every 60s | Ctrl+C to stop")
-    print(f"Detailed logs: {LOG_FILE}")
+    print("Price refresh: 60s | Signals: every completed 5m candle")
+    print("Ctrl+C to stop")
 
 
 # ==========================================
-# SECTION 12 — ONE LIVE CHECK
+# SECTION 13 — ONE LIVE CHECK
 # ==========================================
 
 
@@ -558,29 +496,24 @@ def run_once(state):
         completed = add_indicators(completed_bars(raw))
 
         if len(completed) < 201:
-            raise ValueError(f"Not enough 15-minute history for {symbol}.")
+            raise ValueError(f"Not enough 5-minute history for {symbol}.")
 
         market_data[symbol] = (raw, completed)
         latest_prices[symbol] = float(raw.iloc[-1]["Close"])
 
-    # First execute orders that were queued by earlier completed candles.
     for symbol in SYMBOLS:
         raw, _ = market_data[symbol]
         try_execute_pending_order(state, symbol, raw, latest_prices)
 
-    # Then enforce stop-losses using the newest available prices.
     for symbol in SYMBOLS:
         raw, _ = market_data[symbol]
-        latest_timestamp = timestamp_text(raw.index[-1])
-
         process_stop_loss(
             state,
             symbol,
             latest_prices[symbol],
-            latest_timestamp,
+            timestamp_text(raw.index[-1]),
         )
 
-    # Finally generate new signals from completed candles only.
     for symbol in SYMBOLS:
         _, completed = market_data[symbol]
         process_signal(state, symbol, completed)
@@ -591,15 +524,14 @@ def run_once(state):
 
 
 # ==========================================
-# SECTION 13 — CONTINUOUS BOT LOOP
+# SECTION 14 — CONTINUOUS BOT LOOP
 # ==========================================
 
 
 def main():
     setup_logging()
     state = load_state()
-
-    log_event("Paper trader started")
+    log_event("5-minute paper trader started")
 
     try:
         while True:
@@ -613,8 +545,7 @@ def main():
 
     except KeyboardInterrupt:
         save_state(state)
-        log_event("Paper trader stopped")
-
+        log_event("5-minute paper trader stopped")
         print()
         print("Paper trader stopped.")
         print(f"State saved to {STATE_FILE}")
