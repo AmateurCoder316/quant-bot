@@ -5,3 +5,5 @@ matplotlib
 dash
 plotly
 pyarrow
+scikit-learn
+joblib
