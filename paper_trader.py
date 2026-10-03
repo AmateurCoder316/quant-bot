@@ -31,7 +31,7 @@ from strategy_core import (
 
 PERIOD = "60d"
 POLL_SECONDS = 60
-MIN_BARS = 205
+MIN_BARS = 220
 
 STATE_FILE = Path("paper_state_5m.json")
 LOG_DIR = Path("logs")
@@ -80,7 +80,7 @@ def launch_dashboard():
 # ==========================================
 
 
-def fresh_position():
+def fresh_position(last_exit_time=None):
     return {
         "shares": 0.0,
         "entry_price": None,
@@ -90,6 +90,7 @@ def fresh_position():
         "stop_price": None,
         "pending_order": None,
         "last_signal_bar": None,
+        "last_exit_time": last_exit_time,
     }
 
 
@@ -133,6 +134,7 @@ def load_state():
         position.setdefault("entry_reason", None)
         position.setdefault("pending_order", None)
         position.setdefault("last_signal_bar", None)
+        position.setdefault("last_exit_time", None)
 
     return state
 
@@ -291,7 +293,7 @@ def execute_sell(state, symbol, execution_time, market_price, reason):
         f"pnl={pnl:+.2f}"
     )
 
-    state["positions"][symbol] = fresh_position()
+    state["positions"][symbol] = fresh_position(last_exit_time=execution_time)
 
 
 # ==========================================
@@ -367,7 +369,11 @@ def process_signal(state, symbol, completed):
     if position.get("last_signal_bar") == signal_time:
         return
 
-    signal = strategy_signal(completed, position["shares"] > 0)
+    signal = strategy_signal(
+        completed,
+        position["shares"] > 0,
+        last_exit_time=position.get("last_exit_time"),
+    )
     position["last_signal_bar"] = signal_time
 
     latest = completed.iloc[-1]
@@ -471,17 +477,14 @@ def run_open_market_check(state):
 
     state["last_prices"] = prices
 
-    # Old queued signals fill first on the first later bar.
     for symbol in SYMBOLS:
         raw, _ = market_data[symbol]
         try_execute_pending_order(state, symbol, raw, prices)
 
-    # Then stops are enforced from the newest available bar.
     for symbol in SYMBOLS:
         raw, _ = market_data[symbol]
         process_stop_loss(state, symbol, raw)
 
-    # Finally, completed bars create next-bar orders.
     for symbol in SYMBOLS:
         _, completed = market_data[symbol]
         process_signal(state, symbol, completed)
