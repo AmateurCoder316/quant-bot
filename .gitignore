@@ -6,4 +6,5 @@ ssh
 ssh.pub
 paper_state.json
 paper_state_15m.json
+paper_state_5m.json
 logs/
