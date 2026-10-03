@@ -18,7 +18,7 @@ from strategy_core import (
 
 
 PERIOD = "60d"
-MIN_BARS = 220
+MIN_BARS = 205
 TRADING_DAYS_PER_YEAR = 252
 
 
@@ -87,7 +87,6 @@ def run_backtest(frames, index, commission_rate, slippage_rate):
         closes = {symbol: float(frames[symbol].loc[timestamp, "Close"]) for symbol in SYMBOLS}
         lows = {symbol: float(frames[symbol].loc[timestamp, "Low"]) for symbol in SYMBOLS}
 
-        # 1) Execute signals generated on the previous completed bar.
         for symbol in SYMBOLS:
             position = positions[symbol]
             pending = position["pending"]
@@ -113,7 +112,6 @@ def run_backtest(frames, index, commission_rate, slippage_rate):
                         shares = trade_value / execution_price
                         total_cost = trade_value + commission
                         slippage_cost = shares * max(0.0, execution_price - raw_open)
-                        previous_exit = position.get("last_exit_time")
 
                         cash -= total_cost
                         total_commission += commission
@@ -130,7 +128,7 @@ def run_backtest(frames, index, commission_rate, slippage_rate):
                             "stop_price": stop_price_from_atr(execution_price, atr),
                             "entry_reason": pending["reason"],
                             "pending": None,
-                            "last_exit_time": previous_exit,
+                            "last_exit_time": position.get("last_exit_time"),
                         }
                     else:
                         position["pending"] = None
@@ -167,7 +165,6 @@ def run_backtest(frames, index, commission_rate, slippage_rate):
                 })
                 positions[symbol] = fresh_position(last_exit_time=timestamp)
 
-        # 2) ATR stop-losses during the current bar.
         for symbol in SYMBOLS:
             position = positions[symbol]
             if position["shares"] <= 0 or position["stop_price"] is None:
@@ -203,14 +200,13 @@ def run_backtest(frames, index, commission_rate, slippage_rate):
                 })
                 positions[symbol] = fresh_position(last_exit_time=timestamp)
 
-        # 3) Generate signals from this completed bar for next-bar execution.
         for symbol in SYMBOLS:
             history = frames[symbol].iloc[: i + 1]
             position = positions[symbol]
             signal = strategy_signal(
                 history,
                 position["shares"] > 0,
-                last_exit_time=position.get("last_exit_time"),
+                position.get("last_exit_time"),
             )
 
             if signal.side == "BUY" and position["shares"] == 0:
