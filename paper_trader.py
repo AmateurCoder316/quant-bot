@@ -1,7 +1,7 @@
 import json
-from datetime import datetime, time
+import time
+from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yfinance as yf
@@ -12,28 +12,26 @@ import yfinance as yf
 # ==========================================
 
 SYMBOL = "AAPL"
-PERIOD = "1y"
+INTERVAL = "15m"
+PERIOD = "60d"
+POLL_SECONDS = 60
 STARTING_CASH = 10000.0
 
 COMMISSION_RATE = 0.001      # 0.10%
 SLIPPAGE_RATE = 0.0005       # 0.05%
 
-STATE_FILE = Path("paper_state.json")
-MARKET_TIMEZONE = ZoneInfo("America/New_York")
+# Separate state from the older daily paper trader.
+STATE_FILE = Path("paper_state_15m.json")
 
-# Each strategy gets its own completely separate fake account.
 STRATEGIES = {
     "trend_ma50_200": {
         "name": "Trend MA50/200",
-        "family": "trend",
     },
     "breakout_20_10": {
         "name": "Breakout 20/10",
-        "family": "breakout",
     },
     "mean_reversion_rsi2": {
         "name": "Mean Reversion RSI2",
-        "family": "mean_reversion",
     },
 }
 
@@ -44,51 +42,35 @@ STRATEGIES = {
 
 
 def download_data():
-    """Download recent daily AAPL market data."""
+    """Download recent real AAPL 15-minute market candles."""
 
     data = yf.download(
         SYMBOL,
         period=PERIOD,
-        interval="1d",
+        interval=INTERVAL,
         auto_adjust=True,
         progress=False,
+        prepost=False,
     )
 
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
 
-    return data.dropna().copy()
+    data = data.dropna().copy()
+
+    if len(data) < 2:
+        raise ValueError("Not enough intraday market data was downloaded.")
+
+    return data
 
 
-def latest_completed_bar(data):
+def completed_bars(data):
     """
-    Return data only through the latest completed daily candle.
-
-    During a US trading session, Yahoo can already contain today's row even
-    though today's closing price is not known yet. A daily strategy must not
-    use that unfinished close to create a signal.
+    Exclude the newest Yahoo row because it may still be the currently
+    forming 15-minute candle. Only completed candles may create signals.
     """
 
-    now_ny = datetime.now(MARKET_TIMEZONE)
-    today_ny = pd.Timestamp(now_ny.date())
-
-    completed = data.copy()
-
-    if len(completed) == 0:
-        raise ValueError("No market data was downloaded.")
-
-    last_date = pd.Timestamp(completed.index[-1]).tz_localize(None).normalize()
-
-    # Treat today's row as incomplete until shortly after the regular close.
-    regular_close = time(16, 15)
-
-    if last_date == today_ny and now_ny.time() < regular_close:
-        completed = completed.iloc[:-1]
-
-    if len(completed) == 0:
-        raise ValueError("No completed daily candle is available yet.")
-
-    return completed
+    return data.iloc[:-1].copy()
 
 
 # ==========================================
@@ -97,10 +79,7 @@ def latest_completed_bar(data):
 
 
 def calculate_rsi(series, period=2):
-    """Calculate a simple RSI using exponentially smoothed gains/losses."""
-
     change = series.diff()
-
     gains = change.clip(lower=0)
     losses = -change.clip(upper=0)
 
@@ -108,29 +87,18 @@ def calculate_rsi(series, period=2):
     average_loss = losses.ewm(alpha=1 / period, adjust=False).mean()
 
     rs = average_gain / average_loss.replace(0, float("nan"))
-    rsi = 100 - (100 / (1 + rs))
-
-    # If there have been gains but no losses, RSI is effectively 100.
-    rsi = rsi.fillna(100)
-
-    return rsi
+    return (100 - (100 / (1 + rs))).fillna(100)
 
 
 def add_indicators(data):
-    """Calculate every indicator required by our paper strategies."""
-
     data = data.copy()
 
-    # Trend strategy
     data["MA50"] = data["Close"].rolling(50).mean()
     data["MA200"] = data["Close"].rolling(200).mean()
 
-    # Breakout strategy. shift(1) prevents today's price from being included
-    # in the previous-high / previous-low calculation.
     data["High20"] = data["High"].rolling(20).max().shift(1)
     data["Low10"] = data["Low"].rolling(10).min().shift(1)
 
-    # Mean-reversion strategy
     data["RSI2"] = calculate_rsi(data["Close"], 2)
 
     return data
@@ -142,8 +110,6 @@ def add_indicators(data):
 
 
 def signal_for_strategy(strategy_id, data, has_position):
-    """Return BUY, SELL, or HOLD using the latest completed daily bar."""
-
     latest = data.iloc[-1]
     previous = data.iloc[-2]
 
@@ -182,7 +148,6 @@ def signal_for_strategy(strategy_id, data, has_position):
         return "HOLD"
 
     if strategy_id == "mean_reversion_rsi2":
-        # Only buy short-term weakness while the longer-term trend is positive.
         if pd.isna(latest["MA200"]):
             return "HOLD"
 
@@ -200,19 +165,17 @@ def signal_for_strategy(strategy_id, data, has_position):
 
 
 # ==========================================
-# SECTION 5 — PERSISTENT PAPER ACCOUNT STATE
+# SECTION 5 — PERSISTENT PAPER STATE
 # ==========================================
 
 
 def fresh_account(strategy_id):
-    """Create a brand-new fake account for one strategy."""
-
     return {
         "strategy": strategy_id,
         "cash": STARTING_CASH,
         "shares": 0.0,
         "entry_price": None,
-        "entry_date": None,
+        "entry_time": None,
         "entry_total_cost": None,
         "pending_order": None,
         "last_signal_bar": None,
@@ -221,67 +184,64 @@ def fresh_account(strategy_id):
     }
 
 
-def load_state():
-    """Load paper accounts from disk or create them on the first run."""
+def fresh_state():
+    return {
+        "symbol": SYMBOL,
+        "interval": INTERVAL,
+        "created_at": datetime.now().isoformat(),
+        "accounts": {
+            strategy_id: fresh_account(strategy_id)
+            for strategy_id in STRATEGIES
+        },
+    }
 
+
+def load_state():
     if not STATE_FILE.exists():
-        return {
-            "symbol": SYMBOL,
-            "created_at": datetime.now().isoformat(),
-            "accounts": {
-                strategy_id: fresh_account(strategy_id)
-                for strategy_id in STRATEGIES
-            },
-        }
+        return fresh_state()
 
     with STATE_FILE.open("r", encoding="utf-8") as file:
         state = json.load(file)
 
-    if state.get("symbol") != SYMBOL:
+    if state.get("symbol") != SYMBOL or state.get("interval") != INTERVAL:
         raise ValueError(
-            f"State file belongs to {state.get('symbol')}, not {SYMBOL}. "
-            "Delete paper_state.json before changing SYMBOL."
+            f"{STATE_FILE} belongs to another symbol or interval. "
+            "Delete it to start a fresh 15-minute paper account."
         )
 
     return state
 
 
 def save_state(state):
-    """Persist fake balances, positions, pending orders, and trade history."""
-
     with STATE_FILE.open("w", encoding="utf-8") as file:
         json.dump(state, file, indent=2)
 
 
 # ==========================================
-# SECTION 6 — LOCAL PAPER BROKER
+# SECTION 6 — LOCAL FAKE ORDER EXECUTION
 # ==========================================
 
 
-def execute_buy(account, execution_date, market_open):
-    """Simulate buying with all available fake cash at the day's open."""
-
+def execute_buy(account, execution_time, market_open):
     execution_price = market_open * (1 + SLIPPAGE_RATE)
 
     trade_value = account["cash"] / (1 + COMMISSION_RATE)
     commission = trade_value * COMMISSION_RATE
-
     shares = trade_value / execution_price
+
     total_cost = trade_value + commission
 
     account["cash"] -= total_cost
     account["shares"] = shares
     account["entry_price"] = execution_price
-    account["entry_date"] = execution_date
+    account["entry_time"] = execution_time
     account["entry_total_cost"] = total_cost
     account["pending_order"] = None
 
     return execution_price
 
 
-def execute_sell(account, execution_date, market_open):
-    """Simulate selling the entire fake position at the day's open."""
-
+def execute_sell(account, execution_time, market_open):
     execution_price = market_open * (1 - SLIPPAGE_RATE)
 
     gross_value = account["shares"] * execution_price
@@ -295,8 +255,8 @@ def execute_sell(account, execution_date, market_open):
     account["realized_pnl"] += trade_profit
 
     account["trades"].append({
-        "entry_date": account["entry_date"],
-        "exit_date": execution_date,
+        "entry_time": account["entry_time"],
+        "exit_time": execution_time,
         "entry_price": account["entry_price"],
         "exit_price": execution_price,
         "pnl": trade_profit,
@@ -305,7 +265,7 @@ def execute_sell(account, execution_date, market_open):
 
     account["shares"] = 0.0
     account["entry_price"] = None
-    account["entry_date"] = None
+    account["entry_time"] = None
     account["entry_total_cost"] = None
     account["pending_order"] = None
 
@@ -313,86 +273,75 @@ def execute_sell(account, execution_date, market_open):
 
 
 # ==========================================
-# SECTION 7 — PENDING NEXT-OPEN ORDERS
+# SECTION 7 — NEXT-BAR-OPEN ORDERS
 # ==========================================
 
 
+def timestamp_text(timestamp):
+    return pd.Timestamp(timestamp).isoformat()
+
+
 def try_execute_pending_order(account, raw_data):
-    """
-    Execute yesterday's queued signal at the first later daily opening price.
-
-    The strategy generates a signal only after a daily candle has completed.
-    The order is therefore queued and filled on the next available trading
-    day's open, matching the execution model used by our backtester.
-    """
-
     pending = account["pending_order"]
 
     if pending is None:
         return None
 
-    signal_date = pd.Timestamp(pending["signal_date"])
+    signal_time = pd.Timestamp(pending["signal_time"])
 
-    later_rows = raw_data[
-        pd.to_datetime(raw_data.index).tz_localize(None) > signal_date
-    ]
+    later_rows = raw_data[raw_data.index > signal_time]
 
     if len(later_rows) == 0:
         return None
 
-    execution_date = pd.Timestamp(later_rows.index[0]).date().isoformat()
+    execution_timestamp = later_rows.index[0]
+    execution_time = timestamp_text(execution_timestamp)
     market_open = float(later_rows.iloc[0]["Open"])
 
     if pending["side"] == "BUY" and account["shares"] == 0:
-        price = execute_buy(account, execution_date, market_open)
-        return f"EXECUTED BUY at ${price:.2f} on {execution_date}"
+        price = execute_buy(account, execution_time, market_open)
+        return f"EXECUTED BUY @ ${price:.2f} on {execution_time}"
 
     if pending["side"] == "SELL" and account["shares"] > 0:
-        price, pnl = execute_sell(account, execution_date, market_open)
+        price, pnl = execute_sell(account, execution_time, market_open)
         return (
-            f"EXECUTED SELL at ${price:.2f} on {execution_date} "
+            f"EXECUTED SELL @ ${price:.2f} on {execution_time} "
             f"| trade P/L ${pnl:+.2f}"
         )
 
-    # Position state no longer matches the queued order, so discard it.
     account["pending_order"] = None
     return "Discarded stale pending order"
 
 
 # ==========================================
-# SECTION 8 — CREATE NEW SIGNALS
+# SECTION 8 — PROCESS NEW COMPLETED BAR
 # ==========================================
 
 
-def queue_new_signal(strategy_id, account, completed_data):
-    """Generate at most one signal for each newly completed daily candle."""
+def process_signal(strategy_id, account, data):
+    signal_timestamp = data.index[-1]
+    signal_time = timestamp_text(signal_timestamp)
 
-    signal_date = pd.Timestamp(completed_data.index[-1]).date().isoformat()
-
-    # Running the script repeatedly must not generate duplicate orders from
-    # the same completed candle.
-    if account["last_signal_bar"] == signal_date:
-        return "No new completed daily candle"
-
-    has_position = account["shares"] > 0
+    if account["last_signal_bar"] == signal_time:
+        return None
 
     signal = signal_for_strategy(
         strategy_id,
-        completed_data,
-        has_position,
+        data,
+        account["shares"] > 0,
     )
 
-    account["last_signal_bar"] = signal_date
+    account["last_signal_bar"] = signal_time
 
     if signal in {"BUY", "SELL"}:
         account["pending_order"] = {
             "side": signal,
-            "signal_date": signal_date,
+            "signal_time": signal_time,
         }
 
-        return f"QUEUED {signal} from {signal_date} close"
+        return f"NEW {signal} signal on completed bar {signal_time}"
 
-    return f"HOLD on {signal_date}"
+    return f"HOLD on completed bar {signal_time}"
 
 
 # ==========================================
@@ -408,47 +357,46 @@ def unrealized_pnl(account, latest_price):
     if account["shares"] == 0:
         return 0.0
 
-    current_value = account["shares"] * latest_price
-    return current_value - account["entry_total_cost"]
+    return account["shares"] * latest_price - account["entry_total_cost"]
 
 
 # ==========================================
-# SECTION 10 — MAIN PAPER-TRADING RUN
+# SECTION 10 — ONE LIVE CHECK
 # ==========================================
 
 
-def main():
-    print("Downloading latest market data...")
-
+def run_once(state):
     raw_data = download_data()
-    completed_data = latest_completed_bar(raw_data)
-    completed_data = add_indicators(completed_data)
+    completed = add_indicators(completed_bars(raw_data))
 
-    if len(completed_data) < 201:
-        raise ValueError("Not enough history yet to calculate MA200.")
+    if len(completed) < 201:
+        raise ValueError("Not enough 15-minute history for MA200.")
 
-    state = load_state()
-
-    latest_market_price = float(raw_data.iloc[-1]["Close"])
-    latest_completed_date = pd.Timestamp(completed_data.index[-1]).date().isoformat()
+    latest_price = float(raw_data.iloc[-1]["Close"])
+    latest_completed = timestamp_text(completed.index[-1])
 
     print()
     print("========================================")
-    print("V0.8 LOCAL PAPER TRADER")
+    print("15-MINUTE PAPER CHECK")
     print("========================================")
     print(f"Symbol: {SYMBOL}")
-    print(f"Latest completed signal bar: {latest_completed_date}")
-    print(f"Latest available price: ${latest_market_price:.2f}")
+    print(f"Latest completed bar: {latest_completed}")
+    print(f"Latest available price: ${latest_price:.2f}")
+
+    anything_new = False
 
     for strategy_id, strategy in STRATEGIES.items():
         account = state["accounts"][strategy_id]
 
         execution_message = try_execute_pending_order(account, raw_data)
-        signal_message = queue_new_signal(strategy_id, account, completed_data)
+        signal_message = process_signal(strategy_id, account, completed)
 
-        value = account_value(account, latest_market_price)
+        if execution_message or signal_message:
+            anything_new = True
+
+        value = account_value(account, latest_price)
         total_return = (value / STARTING_CASH - 1) * 100
-        open_pnl = unrealized_pnl(account, latest_market_price)
+        open_pnl = unrealized_pnl(account, latest_price)
 
         print()
         print(f"----- {strategy['name']} -----")
@@ -456,7 +404,11 @@ def main():
         if execution_message:
             print(execution_message)
 
-        print(signal_message)
+        if signal_message:
+            print(signal_message)
+        else:
+            print("No new completed 15-minute candle")
+
         print(f"Cash: ${account['cash']:.2f}")
         print(f"Shares: {account['shares']:.4f}")
         print(f"Account value: ${value:.2f}")
@@ -468,17 +420,50 @@ def main():
         if account["pending_order"]:
             pending = account["pending_order"]
             print(
-                f"Pending order: {pending['side']} "
-                f"after {pending['signal_date']} close"
+                f"Pending: {pending['side']} after "
+                f"{pending['signal_time']}"
             )
         else:
-            print("Pending order: none")
+            print("Pending: none")
 
     save_state(state)
+    return anything_new
 
-    print()
-    print(f"State saved locally to {STATE_FILE}")
-    print("No broker is connected. No real orders were sent.")
+
+# ==========================================
+# SECTION 11 — CONTINUOUS BOT LOOP
+# ==========================================
+
+
+def main():
+    state = load_state()
+
+    print("========================================")
+    print("V0.8 CONTINUOUS LOCAL PAPER TRADER")
+    print("========================================")
+    print(f"Symbol: {SYMBOL}")
+    print(f"Candle interval: {INTERVAL}")
+    print(f"Polling every {POLL_SECONDS} seconds")
+    print("Fake money only. No broker is connected.")
+    print("Press Ctrl+C to stop.")
+
+    try:
+        while True:
+            try:
+                run_once(state)
+            except Exception as error:
+                print()
+                print(f"Check failed: {error}")
+
+            print()
+            print(f"Sleeping {POLL_SECONDS} seconds...")
+            time.sleep(POLL_SECONDS)
+
+    except KeyboardInterrupt:
+        save_state(state)
+        print()
+        print("Paper trader stopped.")
+        print(f"State saved to {STATE_FILE}")
 
 
 if __name__ == "__main__":
