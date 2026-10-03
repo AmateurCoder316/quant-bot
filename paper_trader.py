@@ -25,13 +25,9 @@ from strategy_core import (
 )
 
 
-# ==========================================
-# SETTINGS
-# ==========================================
-
 PERIOD = "60d"
 POLL_SECONDS = 60
-MIN_BARS = 220
+MIN_BARS = 205
 
 STATE_FILE = Path("paper_state_5m.json")
 LOG_DIR = Path("logs")
@@ -39,11 +35,6 @@ LOG_FILE = LOG_DIR / "paper_trader.log"
 TRADE_CSV = LOG_DIR / "trades.csv"
 EQUITY_CSV = LOG_DIR / "equity.csv"
 DASHBOARD_FILE = Path("dashboard.py")
-
-
-# ==========================================
-# LOGGING / DASHBOARD
-# ==========================================
 
 
 def setup_logging():
@@ -73,11 +64,6 @@ def launch_dashboard():
     except Exception:
         logging.exception("Failed to launch dashboard")
         return None
-
-
-# ==========================================
-# STATE
-# ==========================================
 
 
 def fresh_position(last_exit_time=None):
@@ -145,11 +131,6 @@ def save_state(state):
         json.dump(state, file, indent=2)
 
 
-# ==========================================
-# PORTFOLIO HELPERS
-# ==========================================
-
-
 def open_position_count(state):
     return sum(
         float(position.get("shares", 0.0) or 0.0) > 0
@@ -183,11 +164,6 @@ def unrealized_pnl(state, prices):
     return total
 
 
-# ==========================================
-# TRADE RECORDING
-# ==========================================
-
-
 def record_trade(state, symbol, exit_time, exit_price, pnl, return_percent, exit_reason):
     position = state["positions"][symbol]
 
@@ -212,11 +188,6 @@ def record_trade(state, symbol, exit_time, exit_price, pnl, return_percent, exit
         if not file_exists:
             writer.writeheader()
         writer.writerow(trade)
-
-
-# ==========================================
-# ORDER EXECUTION
-# ==========================================
 
 
 def execute_buy(state, symbol, execution_time, market_open, atr, reason, prices):
@@ -296,11 +267,6 @@ def execute_sell(state, symbol, execution_time, market_price, reason):
     state["positions"][symbol] = fresh_position(last_exit_time=execution_time)
 
 
-# ==========================================
-# SIGNAL / EXECUTION PROCESSING
-# ==========================================
-
-
 def timestamp_text(timestamp):
     return pd.Timestamp(timestamp).isoformat()
 
@@ -372,7 +338,7 @@ def process_signal(state, symbol, completed):
     signal = strategy_signal(
         completed,
         position["shares"] > 0,
-        last_exit_time=position.get("last_exit_time"),
+        position.get("last_exit_time"),
     )
     position["last_signal_bar"] = signal_time
 
@@ -389,11 +355,6 @@ def process_signal(state, symbol, completed):
             "signal_time": signal_time,
             "atr": float(latest["ATR14"]) if not pd.isna(latest["ATR14"]) else None,
         }
-
-
-# ==========================================
-# HISTORY / OUTPUT
-# ==========================================
 
 
 def save_equity_snapshot(state, prices):
@@ -457,11 +418,6 @@ def print_money_summary(state, prices):
     print("Ctrl+C to stop")
 
 
-# ==========================================
-# LIVE CHECK
-# ==========================================
-
-
 def run_open_market_check(state):
     market_data = {}
     prices = {}
@@ -504,11 +460,6 @@ def run_once(state):
 
     save_state(state)
     print_money_summary(state, prices)
-
-
-# ==========================================
-# MAIN LOOP
-# ==========================================
 
 
 def main():
