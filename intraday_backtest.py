@@ -18,11 +18,11 @@ from strategy_core import (
 
 
 PERIOD = "60d"
-MIN_BARS = 205
+MIN_BARS = 220
 TRADING_DAYS_PER_YEAR = 252
 
 
-def fresh_position():
+def fresh_position(last_exit_time=None):
     return {
         "shares": 0.0,
         "entry_price": None,
@@ -34,6 +34,7 @@ def fresh_position():
         "stop_price": None,
         "entry_reason": None,
         "pending": None,
+        "last_exit_time": last_exit_time,
     }
 
 
@@ -112,6 +113,7 @@ def run_backtest(frames, index, commission_rate, slippage_rate):
                         shares = trade_value / execution_price
                         total_cost = trade_value + commission
                         slippage_cost = shares * max(0.0, execution_price - raw_open)
+                        previous_exit = position.get("last_exit_time")
 
                         cash -= total_cost
                         total_commission += commission
@@ -128,6 +130,7 @@ def run_backtest(frames, index, commission_rate, slippage_rate):
                             "stop_price": stop_price_from_atr(execution_price, atr),
                             "entry_reason": pending["reason"],
                             "pending": None,
+                            "last_exit_time": previous_exit,
                         }
                     else:
                         position["pending"] = None
@@ -162,7 +165,7 @@ def run_backtest(frames, index, commission_rate, slippage_rate):
                     "commission": position["entry_commission"] + commission,
                     "slippage_cost": position["entry_slippage_cost"] + exit_slippage_cost,
                 })
-                positions[symbol] = fresh_position()
+                positions[symbol] = fresh_position(last_exit_time=timestamp)
 
         # 2) ATR stop-losses during the current bar.
         for symbol in SYMBOLS:
@@ -198,13 +201,17 @@ def run_backtest(frames, index, commission_rate, slippage_rate):
                     "commission": position["entry_commission"] + commission,
                     "slippage_cost": position["entry_slippage_cost"] + exit_slippage_cost,
                 })
-                positions[symbol] = fresh_position()
+                positions[symbol] = fresh_position(last_exit_time=timestamp)
 
         # 3) Generate signals from this completed bar for next-bar execution.
         for symbol in SYMBOLS:
             history = frames[symbol].iloc[: i + 1]
             position = positions[symbol]
-            signal = strategy_signal(history, position["shares"] > 0)
+            signal = strategy_signal(
+                history,
+                position["shares"] > 0,
+                last_exit_time=position.get("last_exit_time"),
+            )
 
             if signal.side == "BUY" and position["shares"] == 0:
                 position["pending"] = {"side": "BUY", "reason": signal.reason}
@@ -239,7 +246,6 @@ def calculate_metrics(equity, trades, final_value):
     drawdowns = values / running_max - 1
     max_drawdown = drawdowns.min() * 100
 
-    # Sharpe is based on one end-of-day observation per session, not 5-minute noise.
     daily = equity.set_index("timestamp")["value"].resample("1D").last().dropna()
     daily_returns = daily.pct_change().dropna()
     sharpe = 0.0
@@ -332,7 +338,7 @@ def main():
     frames, index = download_universe()
 
     print("=" * 68)
-    print("5-MINUTE STRATEGY DIAGNOSTIC")
+    print("5-MINUTE BREAKOUT STRATEGY DIAGNOSTIC")
     print("=" * 68)
     print(f"Symbols:              {', '.join(SYMBOLS)}")
     print(f"Starting cash:        ${STARTING_CASH:,.2f}")
