@@ -98,8 +98,6 @@ def main():
     threshold = float(config["probability_threshold"])
     hold_bars = int(config["hold_bars"])
 
-    # build_trade_candidates uses tune_lr1.HOLD_BARS. Refuse to silently test a
-    # different frozen hold period if that implementation ever changes.
     from tune_lr1 import HOLD_BARS
     if hold_bars != HOLD_BARS:
         raise ValueError(
@@ -120,7 +118,16 @@ def main():
 
     predictions = load_test_predictions()
     frames = load_execution_data()
+
+    above_threshold = predictions.loc[predictions["probability"] >= threshold]
+    print("\n2026 PREDICTION DIAGNOSTICS")
+    print(f"Prediction rows:              {len(predictions):,}")
+    print(f"Maximum probability:          {predictions['probability'].max():.4f}")
+    print(f"Rows >= frozen threshold:     {len(above_threshold):,}")
+    print(f"99th percentile probability:  {predictions['probability'].quantile(0.99):.4f}")
+
     candidates = build_trade_candidates(predictions, frames, threshold)
+    print(f"Executable trade candidates:  {len(candidates):,}")
 
     trades, final_value = run_portfolio(candidates, COMMISSION_RATE, SLIPPAGE_RATE)
     gross_trades, gross_final_value = run_portfolio(candidates, 0.0, 0.0)
