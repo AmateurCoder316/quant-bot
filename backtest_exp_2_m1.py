@@ -4,13 +4,13 @@ import joblib
 
 from exp2_config import EXECUTION_PATH, MODEL_NAME, MODEL_PATH, TEST_YEAR, TUNE_YEAR
 from exp2_core import (
-    evaluate_rule,
     execution_rule_from_result,
     load_event_dataset,
     predict_stack,
     selected_events,
     stack_metrics,
 )
+from exp2_execution import evaluate_rule
 
 
 def print_metrics(title, metrics):
@@ -25,6 +25,12 @@ def print_metrics(title, metrics):
     print(f"Max drawdown:        {metrics['max_drawdown']:+.2f}%")
     print(f"Daily Sharpe:        {metrics['sharpe']:+.2f}")
     print(f"Modeled friction:    ${metrics['friction']:,.2f}")
+    print(
+        f"Positive months:     {metrics['positive_months']}/{metrics['months']} "
+        f"({metrics['positive_month_fraction']*100:.1f}%)"
+    )
+    print(f"Median month:        {metrics['median_month']:+.2f}%")
+    print(f"Worst month:         {metrics['worst_month']:+.2f}%")
 
 
 def main():
