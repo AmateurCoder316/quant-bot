@@ -1,4 +1,7 @@
+import os
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import get_context
 
 from strategy_core import COMMISSION_RATE, SLIPPAGE_RATE
 from strategy_research import (
@@ -11,6 +14,14 @@ from strategy_research import (
 
 
 TOP_N = 5
+DEFAULT_WORKERS = 4
+
+# Worker processes receive these once when the pool starts. On Linux we use
+# fork, so the large read-only market-data frames are shared copy-on-write
+# instead of being serialized for every one of the 216 candidate jobs.
+_WORKER_FRAMES = None
+_WORKER_INDEX = None
+_WORKER_TRAIN_DAYS = None
 
 
 def days_for_years(index, years):
@@ -32,22 +43,68 @@ def format_metrics(m):
     )
 
 
+def worker_count():
+    override = os.getenv("QUANT_RESEARCH_WORKERS")
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            pass
+
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(DEFAULT_WORKERS, cpu_count - 1 if cpu_count > 1 else 1))
+
+
+def _init_worker(frames, index, train_days):
+    global _WORKER_FRAMES, _WORKER_INDEX, _WORKER_TRAIN_DAYS
+    _WORKER_FRAMES = frames
+    _WORKER_INDEX = index
+    _WORKER_TRAIN_DAYS = train_days
+
+
+def _evaluate_training_candidate(params):
+    _, metrics = run_candidate(
+        _WORKER_FRAMES,
+        _WORKER_INDEX,
+        _WORKER_TRAIN_DAYS,
+        params,
+        COMMISSION_RATE,
+        SLIPPAGE_RATE,
+    )
+    return params, metrics
+
+
 def rank_candidates(frames, index, train_days):
     ranked = []
+    workers = worker_count()
 
-    for number, params in enumerate(CANDIDATES, 1):
-        _, m = run_candidate(
-            frames,
-            index,
-            train_days,
-            params,
-            COMMISSION_RATE,
-            SLIPPAGE_RATE,
-        )
-        ranked.append((research_score(m), params, m))
+    print(f"    parallel workers: {workers}", flush=True)
 
-        if number % 25 == 0 or number == len(CANDIDATES):
-            print(f"    evaluated {number:>3}/{len(CANDIDATES)} candidates", flush=True)
+    # Linux/EndeavourOS supports fork. It is useful here because the parent has
+    # already loaded ~373k bars, and the children can initially share those
+    # pages instead of each receiving a fresh serialized copy per candidate.
+    context = get_context("fork")
+
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=context,
+        initializer=_init_worker,
+        initargs=(frames, index, train_days),
+    ) as executor:
+        futures = [executor.submit(_evaluate_training_candidate, params) for params in CANDIDATES]
+
+        completed = 0
+        for future in as_completed(futures):
+            params, m = future.result()
+            ranked.append((research_score(m), params, m))
+            completed += 1
+
+            if completed % 10 == 0 or completed == len(CANDIDATES):
+                print(
+                    f"    evaluated {completed:>3}/{len(CANDIDATES)} candidates "
+                    f"({completed / len(CANDIDATES) * 100:5.1f}%)",
+                    flush=True,
+                )
 
     ranked.sort(key=lambda row: row[0], reverse=True)
     return ranked
@@ -96,6 +153,7 @@ def main():
     print("=" * 104)
     print(f"Years available: {', '.join(map(str, years))}")
     print(f"Candidates:       {len(CANDIDATES)}")
+    print(f"Parallel workers: {worker_count()}")
     print(
         f"Cost model:       commission={COMMISSION_RATE:.3%}/side, "
         f"slippage={SLIPPAGE_RATE:.3%}/side"
@@ -131,8 +189,7 @@ def main():
         for rank, (_, params, train_m) in enumerate(finalists, 1):
             print(f"  {rank}. {params.name:<58} {format_metrics(train_m)}")
 
-        # The strategy actually selected for this walk-forward fold is rank #1
-        # based only on the historical training window.
+        # Rank #1 is frozen before seeing the next year's results.
         _, selected_params, selected_train_m = finalists[0]
         selection_counts[selected_params.name] += 1
 
