@@ -1,7 +1,12 @@
 import numpy as np
 import pandas as pd
 
-from strategy_core import MARKET_TIMEZONE, calculate_atr
+from strategy_core import (
+    COMMISSION_RATE,
+    MARKET_TIMEZONE,
+    SLIPPAGE_RATE,
+    calculate_atr,
+)
 
 
 FEATURE_COLUMNS = [
@@ -39,12 +44,33 @@ FEATURE_COLUMNS = [
 ]
 
 TARGET_COLUMNS = [
+    # Legacy close-to-close targets kept so LR1/LR2/GB1/GB2 remain reproducible.
     "future_return_15m",
     "future_return_30m",
     "future_return_60m",
     "future_max_gain_30m",
     "future_max_loss_30m",
+    # Research-v2 targets aligned to the actual simulator:
+    # signal on bar t, enter next bar open, exit N bars later at the open.
+    "trade_return_30m",
+    "trade_return_60m",
+    "trade_net_return_30m",
+    "trade_net_return_60m",
 ]
+
+
+EXECUTION_TARGETS = {
+    30: {
+        "gross": "trade_return_30m",
+        "net": "trade_net_return_30m",
+        "hold_bars": 6,
+    },
+    60: {
+        "gross": "trade_return_60m",
+        "net": "trade_net_return_60m",
+        "hold_bars": 12,
+    },
+}
 
 
 def _market_local_index(index):
@@ -139,6 +165,37 @@ def build_features(data):
     return frame
 
 
+def _add_execution_target(frame, grouped, minutes, hold_bars):
+    """Target the exact long trade the simulator would make after a signal bar.
+
+    A signal at bar t enters at Open[t+1] and exits at Open[t+1+hold_bars].
+    Grouped shifts guarantee the entry and exit stay inside the same NY session.
+    """
+    entry_open = grouped["Open"].shift(-1).astype(float)
+    exit_open = grouped["Open"].shift(-(hold_bars + 1)).astype(float)
+
+    gross_return = exit_open / entry_open - 1.0
+
+    # Match tune/backtest economics exactly for a long trade. Entry slippage makes
+    # the fill worse; exit slippage makes the sale worse; commission is charged
+    # on both sides. This converts the raw future move into return after the
+    # configured friction assumptions, before portfolio sizing effects.
+    net_factor = (
+        exit_open
+        * (1.0 - SLIPPAGE_RATE)
+        * (1.0 - COMMISSION_RATE)
+        / (
+            entry_open
+            * (1.0 + SLIPPAGE_RATE)
+            * (1.0 + COMMISSION_RATE)
+        )
+    )
+    net_return = net_factor - 1.0
+
+    frame[f"trade_return_{minutes}m"] = gross_return
+    frame[f"trade_net_return_{minutes}m"] = net_return
+
+
 def add_future_targets(data):
     """Add future outcomes without allowing targets to cross trading days."""
     frame = data.copy().sort_index()
@@ -146,7 +203,6 @@ def add_future_targets(data):
     frame["session_date"] = local_index.date
 
     close = frame["Close"].astype(float)
-
     grouped = frame.groupby("session_date", sort=False)
 
     for bars, minutes in ((3, 15), (6, 30), (12, 60)):
@@ -161,6 +217,9 @@ def add_future_targets(data):
     )
     frame["future_max_gain_30m"] = future_high_30 / close - 1.0
     frame["future_max_loss_30m"] = future_low_30 / close - 1.0
+
+    for minutes, spec in EXECUTION_TARGETS.items():
+        _add_execution_target(frame, grouped, minutes, spec["hold_bars"])
 
     return frame
 
