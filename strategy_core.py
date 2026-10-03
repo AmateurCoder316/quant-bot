@@ -22,6 +22,16 @@ RISK_PER_TRADE_PERCENT = 0.005
 ATR_PERIOD = 14
 ATR_STOP_MULTIPLIER = 2.0
 
+# Strategy filters. These deliberately favor fewer, stronger setups.
+BREAKOUT_LOOKBACK = 50
+EXIT_LOOKBACK = 20
+BREAKOUT_ATR_BUFFER = 0.25
+VOLUME_MULTIPLIER = 1.10
+MA_SLOPE_LOOKBACK = 20
+COOLDOWN_BARS = 6
+ENTRY_START = time(10, 0)
+ENTRY_END = time(14, 30)
+
 MARKET_TIMEZONE = ZoneInfo("America/New_York")
 
 
@@ -68,8 +78,9 @@ def add_indicators(data):
 
     data["MA50"] = data["Close"].rolling(50).mean()
     data["MA200"] = data["Close"].rolling(200).mean()
-    data["High20"] = data["High"].rolling(20).max().shift(1)
-    data["Low10"] = data["Low"].rolling(10).min().shift(1)
+    data["HighBreakout"] = data["High"].rolling(BREAKOUT_LOOKBACK).max().shift(1)
+    data["LowExit"] = data["Low"].rolling(EXIT_LOOKBACK).min().shift(1)
+    data["VolumeMA20"] = data["Volume"].rolling(20).mean()
     data["RSI2"] = calculate_rsi(data["Close"], 2)
     data["ATR14"] = calculate_atr(data, ATR_PERIOD)
 
@@ -81,47 +92,81 @@ def add_indicators(data):
 # ==========================================
 
 
-def strategy_signal(data, has_position):
-    """Return a Signal with explicit attribution for every decision."""
+def bars_since_timestamp(data, timestamp):
+    if timestamp is None:
+        return None
+
+    try:
+        ts = pd.Timestamp(timestamp)
+        return int((data.index > ts).sum())
+    except Exception:
+        return None
+
+
+def entry_time_allowed(timestamp):
+    ts = pd.Timestamp(timestamp)
+
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(MARKET_TIMEZONE)
+    else:
+        ts = ts.tz_convert(MARKET_TIMEZONE)
+
+    current = ts.time()
+    return ENTRY_START <= current <= ENTRY_END
+
+
+def strategy_signal(data, has_position, last_exit_time=None):
+    """Return the current 5-minute breakout signal with explicit attribution."""
 
     latest = data.iloc[-1]
 
-    if pd.isna(latest["MA200"]) or pd.isna(latest["ATR14"]):
+    required = [
+        latest.get("MA50"),
+        latest.get("MA200"),
+        latest.get("HighBreakout"),
+        latest.get("LowExit"),
+        latest.get("VolumeMA20"),
+        latest.get("ATR14"),
+    ]
+
+    if any(pd.isna(value) for value in required):
         return Signal("HOLD", "warmup")
 
-    trend_up = latest["Close"] > latest["MA200"]
+    if has_position:
+        # Give winners more room than the old RSI exit did. The ATR stop still
+        # protects the downside while these exits react to trend deterioration.
+        if latest["Close"] < latest["LowExit"]:
+            return Signal("SELL", "breakout_20_exit")
 
-    if not has_position:
-        breakout_buy = (
-            trend_up
-            and not pd.isna(latest["High20"])
-            and latest["Close"] > latest["High20"]
-        )
+        if latest["Close"] < latest["MA50"]:
+            return Signal("SELL", "ma50_exit")
 
-        mean_reversion_buy = trend_up and latest["RSI2"] < 10
+        return Signal("HOLD", "hold_position")
 
-        if breakout_buy:
-            return Signal("BUY", "breakout_20")
+    bars_since_exit = bars_since_timestamp(data, last_exit_time)
+    if bars_since_exit is not None and bars_since_exit < COOLDOWN_BARS:
+        return Signal("HOLD", "cooldown")
 
-        if mean_reversion_buy:
-            return Signal("BUY", "rsi2_mean_reversion")
+    if not entry_time_allowed(data.index[-1]):
+        return Signal("HOLD", "outside_entry_window")
 
-        return Signal("HOLD", "no_entry")
+    if len(data) <= MA_SLOPE_LOOKBACK:
+        return Signal("HOLD", "warmup")
 
-    breakout_sell = (
-        not pd.isna(latest["Low10"])
-        and latest["Close"] < latest["Low10"]
-    )
+    ma50_then = data["MA50"].iloc[-1 - MA_SLOPE_LOOKBACK]
+    if pd.isna(ma50_then):
+        return Signal("HOLD", "warmup")
 
-    mean_reversion_sell = latest["RSI2"] > 70
+    trend_up = latest["Close"] > latest["MA200"] and latest["MA50"] > latest["MA200"]
+    ma50_rising = latest["MA50"] > ma50_then
+    volume_confirmed = latest["Volume"] >= latest["VolumeMA20"] * VOLUME_MULTIPLIER
+    breakout_level = latest["HighBreakout"] + latest["ATR14"] * BREAKOUT_ATR_BUFFER
+    breakout_confirmed = latest["Close"] > breakout_level
 
-    if breakout_sell:
-        return Signal("SELL", "breakout_10_exit")
+    if trend_up and ma50_rising and volume_confirmed and breakout_confirmed:
+        return Signal("BUY", "breakout_50_confirmed")
 
-    if mean_reversion_sell:
-        return Signal("SELL", "rsi2_exit")
-
-    return Signal("HOLD", "hold_position")
+    return Signal("HOLD", "no_entry")
 
 
 # ==========================================
