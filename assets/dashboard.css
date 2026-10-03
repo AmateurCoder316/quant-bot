@@ -32,39 +32,49 @@ input:focus-visible {
   outline-offset: 2px;
 }
 
+/* Dash dropdowns / react-select */
+.Select,
+.Select div,
+.Select span,
+.Select input,
 .Select-control,
 .Select-menu-outer,
-.DateInput,
-.DateInput_input,
-.SingleDatePickerInput,
-.CalendarMonth,
-.CalendarMonthGrid,
-.DayPicker,
-.DayPicker_transitionContainer {
-  background: #161a1f !important;
+.Select-menu,
+.Select-option,
+.VirtualizedSelectOption,
+.VirtualizedSelectFocusedOption {
   color: #f4f5f7 !important;
+}
+
+.Select-control,
+.Select-menu-outer,
+.Select-menu,
+.Select-option,
+.VirtualizedSelectOption {
+  background: #161a1f !important;
   border-color: #232830 !important;
 }
 
-.Select-control,
-.SingleDatePickerInput {
+.Select-control {
   min-height: 36px !important;
   height: 36px !important;
   border-radius: 8px !important;
+  box-shadow: none !important;
 }
 
+.is-focused:not(.is-open) > .Select-control,
+.Select-control:hover {
+  border-color: #323943 !important;
+  box-shadow: none !important;
+}
+
+.Select-value,
 .Select-value-label,
 .Select-placeholder,
-.DateInput_input {
+.Select-single-value,
+.Select-input,
+.Select-input > input {
   color: #f4f5f7 !important;
-}
-
-.DateInput_input {
-  font-size: 13px !important;
-  line-height: 34px !important;
-  height: 34px !important;
-  padding: 0 10px !important;
-  border: 0 !important;
 }
 
 .Select-input {
@@ -72,8 +82,15 @@ input:focus-visible {
 }
 
 .Select-input > input {
-  color: #f4f5f7 !important;
   padding: 8px 0 !important;
+  background: transparent !important;
+}
+
+.Select-arrow-zone,
+.Select-clear-zone,
+.Select-arrow {
+  color: #9aa3ad !important;
+  border-top-color: #9aa3ad !important;
 }
 
 .Select-menu-outer {
@@ -81,22 +98,88 @@ input:focus-visible {
   border-radius: 8px !important;
   margin-top: 4px !important;
   overflow: hidden !important;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35) !important;
 }
 
-.VirtualizedSelectOption {
+.VirtualizedSelectFocusedOption,
+.Select-option.is-focused,
+.Select-option:hover {
+  background: #20262d !important;
+}
+
+.Select-option.is-selected,
+.VirtualizedSelectSelectedOption {
+  background: #262d35 !important;
+}
+
+/* Date picker */
+.DateInput,
+.DateInput_input,
+.SingleDatePicker,
+.SingleDatePickerInput,
+.SingleDatePicker_picker,
+.DayPicker,
+.DayPicker__withBorder,
+.DayPicker_transitionContainer,
+.CalendarMonth,
+.CalendarMonthGrid,
+.CalendarMonthGrid_month__horizontal,
+.CalendarDay {
   background: #161a1f !important;
   color: #f4f5f7 !important;
 }
 
-.VirtualizedSelectFocusedOption {
-  background: #1d232a !important;
+.SingleDatePickerInput {
+  min-height: 36px !important;
+  height: 36px !important;
+  border: 1px solid #232830 !important;
+  border-radius: 8px !important;
+  background: #161a1f !important;
+}
+
+.SingleDatePickerInput__withBorder {
+  border-color: #232830 !important;
+}
+
+.DateInput {
+  width: 132px !important;
+}
+
+.DateInput_input {
+  background: #161a1f !important;
+  color: #f4f5f7 !important;
+  font-size: 13px !important;
+  line-height: 34px !important;
+  height: 34px !important;
+  padding: 0 10px !important;
+  border: 0 !important;
+}
+
+.DateInput_input__focused {
+  border-bottom: 0 !important;
+}
+
+.SingleDatePicker_picker {
+  border-radius: 10px !important;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45) !important;
 }
 
 .DayPicker_weekHeader,
 .CalendarMonth_caption,
 .DayPickerNavigation_button,
+.DayPickerNavigation_button__horizontalDefault,
 .CalendarDay {
   color: #f4f5f7 !important;
+}
+
+.DayPickerNavigation_button,
+.DayPickerNavigation_button__horizontalDefault {
+  background: #161a1f !important;
+  border-color: #232830 !important;
+}
+
+.DayPickerNavigation_svg__horizontal {
+  fill: #f4f5f7 !important;
 }
 
 .CalendarDay {
@@ -104,19 +187,39 @@ input:focus-visible {
   border-color: #232830 !important;
 }
 
-.CalendarDay:hover {
+.CalendarDay:hover,
+.CalendarDay__hovered_span {
   background: #20262d !important;
+  color: #f4f5f7 !important;
 }
 
 .CalendarDay__selected,
-.CalendarDay__selected:hover {
+.CalendarDay__selected:hover,
+.CalendarDay__selected_span {
   background: #8aa4ff !important;
   color: #0b0d10 !important;
   border-color: #8aa4ff !important;
 }
 
-.CalendarDay__blocked_out_of_range {
+.CalendarDay__blocked_out_of_range,
+.CalendarDay__blocked_calendar {
   color: #555d67 !important;
+  background: #111419 !important;
+}
+
+/* Native fallback controls */
+select,
+input[type="date"] {
+  background: #161a1f !important;
+  color: #f4f5f7 !important;
+  border: 1px solid #232830 !important;
+  border-radius: 8px !important;
+  color-scheme: dark;
+}
+
+select option {
+  background: #161a1f !important;
+  color: #f4f5f7 !important;
 }
 
 .dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner table {
