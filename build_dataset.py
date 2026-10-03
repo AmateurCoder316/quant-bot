@@ -7,7 +7,7 @@ import pandas as pd
 
 from features import FEATURE_COLUMNS, TARGET_COLUMNS, build_feature_frame
 from market_data import LOCAL_PROVIDER
-from strategy_core import MARKET_TIMEZONE, SYMBOLS
+from strategy_core import COMMISSION_RATE, MARKET_TIMEZONE, SLIPPAGE_RATE, SYMBOLS
 
 
 OUTPUT_DIR = Path("data") / "ml"
@@ -117,8 +117,18 @@ def main():
         },
         "split_rows": {key: int(value) for key, value in split_counts.items()},
         "symbol_rows": {key: int(value) for key, value in symbol_counts.items()},
-        "target_policy": "Future targets stay within the same America/New_York trading date.",
-        "feature_policy": "Feature columns use current/past regular-session bars only; target columns are not model inputs.",
+        "target_policy": (
+            "All future targets stay within the same America/New_York trading date. "
+            "trade_return targets match next-bar-open entry and later-open exit. "
+            "trade_net_return targets additionally apply the configured commission/slippage model."
+        ),
+        "execution_target_costs": {
+            "commission_rate_per_side": COMMISSION_RATE,
+            "slippage_rate_per_side": SLIPPAGE_RATE,
+        },
+        "feature_policy": (
+            "Feature columns use current/past regular-session bars only; target columns are never model inputs."
+        ),
     }
 
     METADATA_PATH.write_text(json.dumps(metadata, indent=2) + "\n")
@@ -134,7 +144,7 @@ def main():
     print(f"Test:       {split_counts.get('test', 0):,}")
     print(f"Saved:      {DATASET_PATH}")
     print(f"Metadata:   {METADATA_PATH}")
-    print("\nStage 3 dataset is ready for model training.")
+    print("\nStage 3 dataset is ready for model training and walk-forward research.")
 
 
 if __name__ == "__main__":
