@@ -17,6 +17,7 @@ from exp2_config import (
 )
 from exp2_core import (
     BASE_MODEL_SPECS,
+    classification_metrics,
     fit_stack,
     load_event_dataset,
     predict_stack,
@@ -49,7 +50,7 @@ def main():
     print("  2) volatility-scaled 120m triple-barrier outcomes")
     print("  3) overlap/uniqueness-aware sample weights")
     print("  4) diverse base stack: HGB + ExtraTrees + logistic + economic HGB")
-    print("  5) expanding monthly PURGED 2024 OOF predictions")
+    print("  5) expanding monthly PURGED 2024 OOF base predictions")
     print("  6) logistic meta-label model trained only on OOF base predictions")
     print("  7) final base heads refit on 2023-2024")
     print(f"Economic meta-label: net trade return >= +{ECONOMIC_NET_THRESHOLD*100:.2f}%")
@@ -76,38 +77,21 @@ def main():
     print("\nBuilding purged OOF stack and fitting final base models...")
     bundle, oof = fit_stack(train)
 
-    # OOF meta probability must be produced after fitting the meta model. The base
-    # columns in `oof` themselves are strictly OOF by construction.
-    meta_model = bundle["meta_model"]
-    oof_meta_probability = meta_model.predict_proba(
-        oof[bundle["meta_input_columns"]]
-    )[:, 1]
-    oof_for_metrics = oof.copy()
-    oof_for_metrics["meta_probability"] = oof_meta_probability
-
-    # stack_metrics expects the final prediction schema; fill only the columns it
-    # consumes. Base probabilities already came from purged OOF folds.
-    oof_metrics = {
-        "meta_economic": None,
-        "base": {},
-    }
-    from exp2_core import classification_metrics
-
-    oof_metrics["meta_economic"] = classification_metrics(
-        oof["economic_success"], oof_meta_probability
-    )
+    # These are genuinely OOF metrics for the BASE heads. The meta-model is fit on
+    # these OOF rows, so its first honest forward diagnostic is 2025 below.
+    oof_base_metrics = {}
     for name, target, _, _ in BASE_MODEL_SPECS:
-        oof_metrics["base"][name] = classification_metrics(oof[target], oof[name])
+        oof_base_metrics[name] = classification_metrics(oof[target], oof[name])
 
     validation_predictions = predict_stack(bundle, validation)
     validation_metrics = stack_metrics(validation, validation_predictions)
 
     print("\n" + "=" * 118)
-    print("PURGED 2024 OOF DIAGNOSTICS")
+    print("PURGED 2024 BASE-MODEL OOF DIAGNOSTICS")
     print("=" * 118)
-    print_metric_block("META economic", oof_metrics["meta_economic"])
+    print("Meta-model is NOT scored here because these OOF rows are its training set.")
     for name, _, _, _ in BASE_MODEL_SPECS:
-        print_metric_block(name, oof_metrics["base"][name])
+        print_metric_block(name, oof_base_metrics[name])
 
     print("\nOOF folds:")
     for fold in bundle["oof_fold_rows"]:
@@ -119,6 +103,7 @@ def main():
     print("\n" + "=" * 118)
     print("2025 FORWARD VALIDATION MODEL DIAGNOSTICS")
     print("=" * 118)
+    print("This is the first forward evaluation of the fitted meta-model.")
     print_metric_block("META economic", validation_metrics["meta_economic"])
     for name, _, _, _ in BASE_MODEL_SPECS:
         print_metric_block(name, validation_metrics[name])
@@ -150,11 +135,11 @@ def main():
             for name, target, kind, seed in BASE_MODEL_SPECS
         ],
         "oof_folds": bundle["oof_fold_rows"],
-        "oof_metrics": oof_metrics,
+        "oof_base_metrics": oof_base_metrics,
         "validation_metrics": validation_metrics,
         "methodology": {
             "base_training": (
-                "Unique/economic sample weights plus class balancing; boosted heads use fixed "
+                "Uniqueness/economic sample weights plus class balancing; boosted heads use fixed "
                 "iterations with no internal random early-stopping split."
             ),
             "stacking": (
@@ -163,7 +148,7 @@ def main():
             ),
             "meta_model": (
                 "Regularized logistic meta-label classifier trained on OOF base probabilities "
-                "plus compact regime/context features."
+                "plus compact regime/context features; first forward meta evaluation is 2025."
             ),
         },
     }
