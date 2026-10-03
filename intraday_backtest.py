@@ -1,5 +1,5 @@
 import math
-from collections import Counter, defaultdict
+from collections import Counter
 
 import pandas as pd
 
@@ -19,7 +19,7 @@ from strategy_core import (
 
 PERIOD = "60d"
 MIN_BARS = 205
-BARS_PER_YEAR = 78 * 252
+TRADING_DAYS_PER_YEAR = 252
 
 
 def fresh_position():
@@ -28,17 +28,20 @@ def fresh_position():
         "entry_price": None,
         "entry_time": None,
         "entry_cost": None,
+        "entry_raw_price": None,
+        "entry_commission": 0.0,
+        "entry_slippage_cost": 0.0,
         "stop_price": None,
         "entry_reason": None,
         "pending": None,
     }
 
 
-def portfolio_value(cash, positions, close_prices):
+def portfolio_value(cash, positions, prices):
     value = cash
     for symbol, position in positions.items():
         if position["shares"] > 0:
-            value += position["shares"] * close_prices[symbol]
+            value += position["shares"] * prices[symbol]
     return value
 
 
@@ -66,13 +69,14 @@ def download_universe():
     return {symbol: frame.loc[common_index].copy() for symbol, frame in data.items()}, common_index
 
 
-def run_backtest():
-    frames, index = download_universe()
-
+def run_backtest(frames, index, commission_rate, slippage_rate):
     cash = STARTING_CASH
     positions = {symbol: fresh_position() for symbol in SYMBOLS}
     trades = []
     equity = []
+
+    total_commission = 0.0
+    total_slippage_cost = 0.0
 
     for i in range(MIN_BARS, len(index)):
         timestamp = index[i]
@@ -93,7 +97,8 @@ def run_backtest():
                 if open_count(positions) < MAX_OPEN_POSITIONS:
                     marked_value = portfolio_value(cash, positions, opens)
                     atr = float(frames[symbol].loc[previous_timestamp, "ATR14"])
-                    execution_price = opens[symbol] * (1 + SLIPPAGE_RATE)
+                    raw_open = opens[symbol]
+                    execution_price = raw_open * (1 + slippage_rate)
                     allocation = risk_sized_trade_value(
                         marked_value,
                         cash,
@@ -102,17 +107,24 @@ def run_backtest():
                     )
 
                     if allocation > 0:
-                        trade_value = allocation / (1 + COMMISSION_RATE)
-                        commission = trade_value * COMMISSION_RATE
+                        trade_value = allocation / (1 + commission_rate)
+                        commission = trade_value * commission_rate
                         shares = trade_value / execution_price
                         total_cost = trade_value + commission
+                        slippage_cost = shares * max(0.0, execution_price - raw_open)
 
                         cash -= total_cost
+                        total_commission += commission
+                        total_slippage_cost += slippage_cost
+
                         positions[symbol] = {
                             "shares": shares,
                             "entry_price": execution_price,
                             "entry_time": timestamp,
                             "entry_cost": total_cost,
+                            "entry_raw_price": raw_open,
+                            "entry_commission": commission,
+                            "entry_slippage_cost": slippage_cost,
                             "stop_price": stop_price_from_atr(execution_price, atr),
                             "entry_reason": pending["reason"],
                             "pending": None,
@@ -123,14 +135,19 @@ def run_backtest():
                     position["pending"] = None
 
             elif pending["side"] == "SELL" and position["shares"] > 0:
-                execution_price = opens[symbol] * (1 - SLIPPAGE_RATE)
+                raw_open = opens[symbol]
+                execution_price = raw_open * (1 - slippage_rate)
                 gross = position["shares"] * execution_price
-                commission = gross * COMMISSION_RATE
+                commission = gross * commission_rate
                 net = gross - commission
                 pnl = net - position["entry_cost"]
                 return_pct = pnl / position["entry_cost"] * 100
+                exit_slippage_cost = position["shares"] * max(0.0, raw_open - execution_price)
 
                 cash += net
+                total_commission += commission
+                total_slippage_cost += exit_slippage_cost
+
                 trades.append({
                     "symbol": symbol,
                     "entry_time": position["entry_time"],
@@ -142,6 +159,8 @@ def run_backtest():
                     "pnl": pnl,
                     "return_percent": return_pct,
                     "holding_minutes": (timestamp - position["entry_time"]).total_seconds() / 60,
+                    "commission": position["entry_commission"] + commission,
+                    "slippage_cost": position["entry_slippage_cost"] + exit_slippage_cost,
                 })
                 positions[symbol] = fresh_position()
 
@@ -152,15 +171,19 @@ def run_backtest():
                 continue
 
             if lows[symbol] <= position["stop_price"]:
-                stop_market_price = min(opens[symbol], position["stop_price"])
-                execution_price = stop_market_price * (1 - SLIPPAGE_RATE)
+                raw_exit = min(opens[symbol], position["stop_price"])
+                execution_price = raw_exit * (1 - slippage_rate)
                 gross = position["shares"] * execution_price
-                commission = gross * COMMISSION_RATE
+                commission = gross * commission_rate
                 net = gross - commission
                 pnl = net - position["entry_cost"]
                 return_pct = pnl / position["entry_cost"] * 100
+                exit_slippage_cost = position["shares"] * max(0.0, raw_exit - execution_price)
 
                 cash += net
+                total_commission += commission
+                total_slippage_cost += exit_slippage_cost
+
                 trades.append({
                     "symbol": symbol,
                     "entry_time": position["entry_time"],
@@ -172,6 +195,8 @@ def run_backtest():
                     "pnl": pnl,
                     "return_percent": return_pct,
                     "holding_minutes": (timestamp - position["entry_time"]).total_seconds() / 60,
+                    "commission": position["entry_commission"] + commission,
+                    "slippage_cost": position["entry_slippage_cost"] + exit_slippage_cost,
                 })
                 positions[symbol] = fresh_position()
 
@@ -189,11 +214,15 @@ def run_backtest():
         value = portfolio_value(cash, positions, closes)
         equity.append({"timestamp": timestamp, "value": value})
 
-    # Mark open positions at the final close for reporting only.
     final_prices = {symbol: float(frames[symbol].iloc[-1]["Close"]) for symbol in SYMBOLS}
     final_value = portfolio_value(cash, positions, final_prices)
 
-    return pd.DataFrame(equity), pd.DataFrame(trades), final_value, positions
+    diagnostics = {
+        "total_commission": total_commission,
+        "total_slippage_cost": total_slippage_cost,
+    }
+
+    return pd.DataFrame(equity), pd.DataFrame(trades), final_value, positions, diagnostics
 
 
 def calculate_metrics(equity, trades, final_value):
@@ -202,15 +231,22 @@ def calculate_metrics(equity, trades, final_value):
     if equity.empty:
         return {}
 
+    equity = equity.copy()
+    equity["timestamp"] = pd.to_datetime(equity["timestamp"])
     values = equity["value"].astype(float)
-    returns = values.pct_change().dropna()
+
     running_max = values.cummax()
     drawdowns = values / running_max - 1
     max_drawdown = drawdowns.min() * 100
 
+    # Sharpe is based on one end-of-day observation per session, not 5-minute noise.
+    daily = equity.set_index("timestamp")["value"].resample("1D").last().dropna()
+    daily_returns = daily.pct_change().dropna()
     sharpe = 0.0
-    if len(returns) > 1 and returns.std() > 0:
-        sharpe = returns.mean() / returns.std() * math.sqrt(BARS_PER_YEAR)
+    if len(daily_returns) > 1 and daily_returns.std() > 0:
+        sharpe = daily_returns.mean() / daily_returns.std() * math.sqrt(TRADING_DAYS_PER_YEAR)
+
+    trading_days = max(1, len(daily))
 
     if trades.empty:
         return {
@@ -218,6 +254,8 @@ def calculate_metrics(equity, trades, final_value):
             "max_drawdown": max_drawdown,
             "sharpe": sharpe,
             "trades": 0,
+            "trades_per_day": 0.0,
+            "trading_days": trading_days,
         }
 
     wins = trades[trades["pnl"] > 0]
@@ -232,6 +270,8 @@ def calculate_metrics(equity, trades, final_value):
         "max_drawdown": max_drawdown,
         "sharpe": sharpe,
         "trades": len(trades),
+        "trades_per_day": len(trades) / trading_days,
+        "trading_days": trading_days,
         "win_rate": len(wins) / len(trades) * 100,
         "profit_factor": profit_factor,
         "expectancy": trades["pnl"].mean(),
@@ -240,53 +280,82 @@ def calculate_metrics(equity, trades, final_value):
     }
 
 
-def print_report(equity, trades, final_value, positions):
+def print_one_report(title, equity, trades, final_value, positions, diagnostics):
     metrics = calculate_metrics(equity, trades, final_value)
 
-    print("=" * 64)
-    print("5-MINUTE PORTFOLIO BACKTEST")
-    print("=" * 64)
-    print(f"Symbols:             {', '.join(SYMBOLS)}")
-    print(f"Starting cash:       ${STARTING_CASH:,.2f}")
-    print(f"Final value:         ${final_value:,.2f}")
-    print(f"Total return:        {metrics.get('total_return', 0):+.2f}%")
-    print(f"Max drawdown:        {metrics.get('max_drawdown', 0):+.2f}%")
-    print(f"Sharpe:              {metrics.get('sharpe', 0):.2f}")
-    print(f"Completed trades:    {metrics.get('trades', 0)}")
+    print("\n" + "=" * 68)
+    print(title)
+    print("=" * 68)
+    print(f"Final value:          ${final_value:,.2f}")
+    print(f"Total return:         {metrics.get('total_return', 0):+.2f}%")
+    print(f"Max drawdown:         {metrics.get('max_drawdown', 0):+.2f}%")
+    print(f"Daily Sharpe:         {metrics.get('sharpe', 0):.2f}")
+    print(f"Trading days:         {metrics.get('trading_days', 0)}")
+    print(f"Completed trades:     {metrics.get('trades', 0)}")
+    print(f"Trades / day:         {metrics.get('trades_per_day', 0):.1f}")
+    print(f"Commission paid:      ${diagnostics['total_commission']:,.2f}")
+    print(f"Slippage cost est.:   ${diagnostics['total_slippage_cost']:,.2f}")
+    print(f"Total friction est.:  ${diagnostics['total_commission'] + diagnostics['total_slippage_cost']:,.2f}")
 
     if not trades.empty:
-        print(f"Win rate:            {metrics['win_rate']:.2f}%")
-        print(f"Profit factor:       {metrics['profit_factor']:.2f}")
-        print(f"Expectancy/trade:    ${metrics['expectancy']:+.2f}")
-        print(f"Avg trade return:    {metrics['average_trade_return']:+.2f}%")
-        print(f"Avg holding time:    {metrics['average_holding_minutes']:.1f} min")
+        print(f"Win rate:             {metrics['win_rate']:.2f}%")
+        print(f"Profit factor:        {metrics['profit_factor']:.2f}")
+        print(f"Expectancy / trade:   ${metrics['expectancy']:+.2f}")
+        print(f"Avg trade return:     {metrics['average_trade_return']:+.3f}%")
+        print(f"Avg holding time:     {metrics['average_holding_minutes']:.1f} min")
 
         print("\nBY SYMBOL")
         for symbol, group in trades.groupby("symbol"):
             print(
-                f"{symbol:<6} trades={len(group):>3} "
-                f"P/L=${group['pnl'].sum():+8.2f} "
+                f"{symbol:<6} trades={len(group):>4} "
+                f"P/L=${group['pnl'].sum():+9.2f} "
                 f"win={((group['pnl'] > 0).mean() * 100):5.1f}%"
             )
 
         print("\nBY ENTRY SIGNAL")
         for reason, group in trades.groupby("entry_reason"):
             print(
-                f"{reason:<24} trades={len(group):>3} "
-                f"P/L=${group['pnl'].sum():+8.2f} "
+                f"{reason:<24} trades={len(group):>4} "
+                f"P/L=${group['pnl'].sum():+9.2f} "
                 f"win={((group['pnl'] > 0).mean() * 100):5.1f}%"
             )
 
         print("\nEXIT REASONS")
-        counts = Counter(trades["exit_reason"])
-        for reason, count in counts.items():
+        for reason, count in Counter(trades["exit_reason"]).items():
             print(f"{reason:<24} {count}")
 
     open_symbols = [symbol for symbol, position in positions.items() if position["shares"] > 0]
-    print(f"\nOpen at end:         {', '.join(open_symbols) if open_symbols else 'none'}")
-    print("\nNote: yfinance 5-minute history is limited, so this is a short intraday sample.")
+    print(f"\nOpen at end:          {', '.join(open_symbols) if open_symbols else 'none'}")
+
+
+def main():
+    frames, index = download_universe()
+
+    print("=" * 68)
+    print("5-MINUTE STRATEGY DIAGNOSTIC")
+    print("=" * 68)
+    print(f"Symbols:              {', '.join(SYMBOLS)}")
+    print(f"Starting cash:        ${STARTING_CASH:,.2f}")
+    print(f"Configured costs:     commission={COMMISSION_RATE:.3%} / side, slippage={SLIPPAGE_RATE:.3%} / side")
+
+    live = run_backtest(frames, index, COMMISSION_RATE, SLIPPAGE_RATE)
+    frictionless = run_backtest(frames, index, 0.0, 0.0)
+
+    print_one_report("CONFIGURED COST MODEL", *live)
+    print_one_report("FRICTIONLESS DIAGNOSTIC", *frictionless)
+
+    live_return = (live[2] / STARTING_CASH - 1) * 100
+    zero_return = (frictionless[2] / STARTING_CASH - 1) * 100
+
+    print("\n" + "=" * 68)
+    print("COST DIAGNOSIS")
+    print("=" * 68)
+    print(f"Return with costs:    {live_return:+.2f}%")
+    print(f"Return without costs: {zero_return:+.2f}%")
+    print(f"Cost-model drag:      {live_return - zero_return:+.2f} percentage points")
+    print("\nThis comparison is diagnostic only. A frictionless result is not a realistic trading result.")
+    print("yfinance 5-minute history is limited, so this remains a short intraday sample.")
 
 
 if __name__ == "__main__":
-    equity, trades, final_value, positions = run_backtest()
-    print_report(equity, trades, final_value, positions)
+    main()
