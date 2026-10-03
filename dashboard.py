@@ -1,7 +1,7 @@
 import json
 import time
 import webbrowser
-from datetime import date, datetime
+from datetime import datetime, timedelta, time as dt_time
 from pathlib import Path
 from threading import Timer
 from zoneinfo import ZoneInfo
@@ -9,56 +9,60 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import plotly.graph_objects as go
 import yfinance as yf
-from dash import Dash, Input, Output, State, dcc, html, dash_table, no_update
+from dash import Dash, Input, Output, State, ctx, dcc, html, dash_table
+
+
+# ==========================================
+# SETTINGS
+# ==========================================
 
 SYMBOLS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
 INTERVAL = "5m"
-PERIOD = "60d"
 STARTING_CASH = 10000.0
 COMMISSION_RATE = 0.001
 SLIPPAGE_RATE = 0.0005
 POSITION_SIZE_PERCENT = 0.20
 MAX_OPEN_POSITIONS = 3
 STOP_LOSS_PERCENT = 0.05
-REFRESH_MS = 30_000
 
 STATE_FILE = Path("paper_state_5m.json")
-LOG_FILE = Path("logs/paper_trader.log")
 EQUITY_FILE = Path("logs/equity.csv")
 TRADES_FILE = Path("logs/trades.csv")
 
 NY = ZoneInfo("America/New_York")
 
-BG = "#090b0f"
-PANEL = "#101318"
-BORDER = "#252a33"
-TEXT = "#f4f6f8"
-MUTED = "#8b93a1"
-GREEN = "#37d67a"
-RED = "#ff5c6c"
-BLUE = "#6ea8fe"
-YELLOW = "#e7b955"
+# One visual system. Green/red are reserved for financial meaning only.
+BG = "#0b0d10"
+SURFACE = "#111418"
+SURFACE_2 = "#161a1f"
+BORDER = "#232830"
+TEXT = "#f4f5f7"
+MUTED = "#8b929c"
+ACCENT = "#8aa4ff"
+GREEN = "#42c985"
+RED = "#ef6673"
+YELLOW = "#d7b55b"
+FONT = "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+RADIUS = "10px"
+SPACE = "16px"
+
+# Local single-user replay engine. It never touches live paper state.
+REPLAY = {
+    "date": None,
+    "data": {},
+    "timeline": [],
+    "step": -1,
+    "playing": False,
+    "speed": 1,
+    "state": None,
+    "equity": [],
+    "error": None,
+}
 
 
-def blank_position():
-    return {
-        "shares": 0.0,
-        "entry_price": None,
-        "entry_time": None,
-        "entry_total_cost": None,
-        "stop_price": None,
-        "pending_order": None,
-        "last_signal_bar": None,
-    }
-
-
-def fresh_state():
-    return {
-        "cash": STARTING_CASH,
-        "realized_pnl": 0.0,
-        "positions": {symbol: blank_position() for symbol in SYMBOLS},
-        "trades": [],
-    }
+# ==========================================
+# FILE + MARKET HELPERS
+# ==========================================
 
 
 def read_state():
@@ -66,17 +70,9 @@ def read_state():
         return fresh_state()
     try:
         with STATE_FILE.open("r", encoding="utf-8") as file:
-            state = json.load(file)
+            return json.load(file)
     except (json.JSONDecodeError, OSError):
         return fresh_state()
-
-    state.setdefault("cash", STARTING_CASH)
-    state.setdefault("realized_pnl", 0.0)
-    state.setdefault("trades", [])
-    state.setdefault("positions", {})
-    for symbol in SYMBOLS:
-        state["positions"].setdefault(symbol, blank_position())
-    return state
 
 
 def read_csv(path):
@@ -88,93 +84,130 @@ def read_csv(path):
         return pd.DataFrame()
 
 
-def flatten_columns(data):
+def flatten(data):
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
-    return data
+    return data.dropna().copy()
 
 
-def download_data(symbol, period=PERIOD):
-    data = yf.download(
-        symbol,
-        period=period,
-        interval=INTERVAL,
-        auto_adjust=True,
-        progress=False,
-        prepost=False,
+def download_live(symbol):
+    return flatten(
+        yf.download(
+            symbol,
+            period="5d",
+            interval=INTERVAL,
+            auto_adjust=True,
+            progress=False,
+            prepost=False,
+        )
     )
-    return flatten_columns(data).dropna().copy()
+
+
+def latest_live_prices():
+    prices = {}
+    for symbol in SYMBOLS:
+        try:
+            data = flatten(
+                yf.download(
+                    symbol,
+                    period="1d",
+                    interval="1m",
+                    auto_adjust=True,
+                    progress=False,
+                    prepost=False,
+                )
+            )
+            if not data.empty:
+                prices[symbol] = float(data.iloc[-1]["Close"])
+        except Exception:
+            pass
+    return prices
+
+
+def market_status():
+    now = datetime.now(NY)
+    if now.weekday() >= 5:
+        return "CLOSED", MUTED, "Weekend"
+    if dt_time(9, 30) <= now.time() < dt_time(16, 0):
+        return "OPEN", GREEN, "US regular session"
+    return "CLOSED", MUTED, "Outside regular session"
+
+
+# ==========================================
+# STRATEGY + PORTFOLIO HELPERS
+# ==========================================
+
+
+def calculate_rsi(series, period=2):
+    change = series.diff()
+    gains = change.clip(lower=0)
+    losses = -change.clip(upper=0)
+    average_gain = gains.ewm(alpha=1 / period, adjust=False).mean()
+    average_loss = losses.ewm(alpha=1 / period, adjust=False).mean()
+    rs = average_gain / average_loss.replace(0, float("nan"))
+    return (100 - (100 / (1 + rs))).fillna(100)
 
 
 def add_indicators(data):
     data = data.copy()
-    change = data["Close"].diff()
-    gains = change.clip(lower=0)
-    losses = -change.clip(upper=0)
-    avg_gain = gains.ewm(alpha=1 / 2, adjust=False).mean()
-    avg_loss = losses.ewm(alpha=1 / 2, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, float("nan"))
-    data["RSI2"] = (100 - (100 / (1 + rs))).fillna(100)
-    data["MA20"] = data["Close"].rolling(20).mean()
     data["MA50"] = data["Close"].rolling(50).mean()
     data["MA200"] = data["Close"].rolling(200).mean()
     data["High20"] = data["High"].rolling(20).max().shift(1)
     data["Low10"] = data["Low"].rolling(10).min().shift(1)
+    data["RSI2"] = calculate_rsi(data["Close"], 2)
     return data
 
 
-def as_ny_index(index):
-    idx = pd.DatetimeIndex(index)
-    if idx.tz is None:
-        return idx.tz_localize(NY)
-    return idx.tz_convert(NY)
+def strategy_signal(data, has_position):
+    latest = data.iloc[-1]
+    if pd.isna(latest["MA200"]):
+        return "HOLD"
+
+    trend_up = latest["Close"] > latest["MA200"]
+
+    if not has_position:
+        breakout_buy = not pd.isna(latest["High20"]) and latest["Close"] > latest["High20"]
+        mean_reversion_buy = trend_up and latest["RSI2"] < 10
+        if breakout_buy or mean_reversion_buy:
+            return "BUY"
+
+    if has_position:
+        breakout_sell = not pd.isna(latest["Low10"]) and latest["Close"] < latest["Low10"]
+        mean_reversion_sell = latest["RSI2"] > 70
+        if breakout_sell or mean_reversion_sell:
+            return "SELL"
+
+    return "HOLD"
 
 
-def day_slice(data, selected_date):
-    if data.empty:
-        return data
-    ny_index = as_ny_index(data.index)
-    mask = ny_index.date == selected_date
-    sliced = data.loc[mask].copy()
-    sliced.index = ny_index[mask]
-    return sliced
+def fresh_position():
+    return {
+        "shares": 0.0,
+        "entry_price": None,
+        "entry_time": None,
+        "entry_total_cost": None,
+        "stop_price": None,
+        "pending_order": None,
+    }
 
 
-def latest_prices_and_times():
-    prices = {}
-    timestamps = {}
-    for symbol in SYMBOLS:
-        try:
-            data = yf.download(
-                symbol,
-                period="1d",
-                interval="1m",
-                auto_adjust=True,
-                progress=False,
-                prepost=False,
-            )
-            data = flatten_columns(data).dropna()
-            if data.empty:
-                continue
-            prices[symbol] = float(data.iloc[-1]["Close"])
-            timestamps[symbol] = as_ny_index(data.index)[-1]
-        except Exception:
-            continue
-    return prices, timestamps
+def fresh_state():
+    return {
+        "cash": STARTING_CASH,
+        "realized_pnl": 0.0,
+        "positions": {symbol: fresh_position() for symbol in SYMBOLS},
+        "trades": [],
+    }
 
 
 def position_count(state):
-    return sum(
-        1
-        for position in state.get("positions", {}).values()
-        if float(position.get("shares", 0.0) or 0.0) > 0
-    )
+    return sum(1 for p in state.get("positions", {}).values() if float(p.get("shares", 0) or 0) > 0)
 
 
 def portfolio_value(state, prices):
     value = float(state.get("cash", STARTING_CASH))
     for symbol, position in state.get("positions", {}).items():
-        shares = float(position.get("shares", 0.0) or 0.0)
+        shares = float(position.get("shares", 0) or 0)
         if shares > 0 and symbol in prices:
             value += shares * prices[symbol]
     return value
@@ -183,562 +216,617 @@ def portfolio_value(state, prices):
 def unrealized_pnl(state, prices):
     total = 0.0
     for symbol, position in state.get("positions", {}).items():
-        shares = float(position.get("shares", 0.0) or 0.0)
-        entry_cost = position.get("entry_total_cost")
-        if shares <= 0 or entry_cost is None or symbol not in prices:
-            continue
-        total += shares * prices[symbol] - float(entry_cost)
+        shares = float(position.get("shares", 0) or 0)
+        cost = position.get("entry_total_cost")
+        if shares > 0 and cost is not None and symbol in prices:
+            total += shares * prices[symbol] - float(cost)
     return total
 
 
 def pnl_color(value):
-    if value > 0:
-        return GREEN
-    if value < 0:
-        return RED
-    return TEXT
+    return GREEN if value > 0 else RED if value < 0 else TEXT
 
 
-def strategy_signal(row, has_position):
-    if pd.isna(row["MA200"]):
-        return "HOLD"
-    trend_up = row["Close"] > row["MA200"]
-    if not has_position:
-        breakout_buy = not pd.isna(row["High20"]) and row["Close"] > row["High20"]
-        mean_reversion_buy = trend_up and row["RSI2"] < 10
-        if breakout_buy or mean_reversion_buy:
-            return "BUY"
-    if has_position:
-        breakout_sell = not pd.isna(row["Low10"]) and row["Close"] < row["Low10"]
-        mean_reversion_sell = row["RSI2"] > 70
-        if breakout_sell or mean_reversion_sell:
-            return "SELL"
-    return "HOLD"
+# ==========================================
+# REPLAY ENGINE
+# ==========================================
 
 
-def sim_execute_buy(state, symbol, timestamp, market_open, prices):
+def load_replay_day(date_text):
+    try:
+        selected = pd.Timestamp(date_text).date()
+        warmup_start = selected - timedelta(days=14)
+        end = selected + timedelta(days=1)
+
+        prepared = {}
+        for symbol in SYMBOLS:
+            data = flatten(
+                yf.download(
+                    symbol,
+                    start=warmup_start.isoformat(),
+                    end=end.isoformat(),
+                    interval=INTERVAL,
+                    auto_adjust=True,
+                    progress=False,
+                    prepost=False,
+                )
+            )
+            if data.empty:
+                continue
+            data = add_indicators(data)
+            prepared[symbol] = data
+
+        if "AAPL" not in prepared:
+            raise ValueError("No 5-minute data available for that date.")
+
+        aapl = prepared["AAPL"]
+        timeline = [
+            ts for ts in aapl.index
+            if pd.Timestamp(ts).date() == selected
+        ]
+        if not timeline:
+            raise ValueError("No regular-session candles for that date.")
+
+        REPLAY.update({
+            "date": date_text,
+            "data": prepared,
+            "timeline": timeline,
+            "step": -1,
+            "playing": False,
+            "state": fresh_state(),
+            "equity": [],
+            "error": None,
+        })
+    except Exception as error:
+        REPLAY.update({"error": str(error), "playing": False})
+
+
+def execute_replay_buy(state, symbol, timestamp, market_open, current_value):
     position = state["positions"][symbol]
     if position["shares"] > 0 or position_count(state) >= MAX_OPEN_POSITIONS:
+        position["pending_order"] = None
         return
-    total_value = portfolio_value(state, prices)
-    allocation = min(state["cash"], total_value * POSITION_SIZE_PERCENT)
+
+    allocation = min(state["cash"], current_value * POSITION_SIZE_PERCENT)
     if allocation <= 0:
+        position["pending_order"] = None
         return
-    execution_price = market_open * (1 + SLIPPAGE_RATE)
+
+    price = market_open * (1 + SLIPPAGE_RATE)
     trade_value = allocation / (1 + COMMISSION_RATE)
     commission = trade_value * COMMISSION_RATE
-    shares = trade_value / execution_price
+    shares = trade_value / price
     total_cost = trade_value + commission
+
     state["cash"] -= total_cost
-    position["shares"] = shares
-    position["entry_price"] = execution_price
-    position["entry_time"] = timestamp.isoformat()
-    position["entry_total_cost"] = total_cost
-    position["stop_price"] = execution_price * (1 - STOP_LOSS_PERCENT)
-    position["pending_order"] = None
+    position.update({
+        "shares": shares,
+        "entry_price": price,
+        "entry_time": pd.Timestamp(timestamp).isoformat(),
+        "entry_total_cost": total_cost,
+        "stop_price": price * (1 - STOP_LOSS_PERCENT),
+        "pending_order": None,
+    })
 
 
-def sim_execute_sell(state, symbol, timestamp, market_price, reason):
+def execute_replay_sell(state, symbol, timestamp, market_price, reason):
     position = state["positions"][symbol]
     if position["shares"] <= 0:
+        position["pending_order"] = None
         return
-    execution_price = market_price * (1 - SLIPPAGE_RATE)
-    gross = position["shares"] * execution_price
+
+    price = market_price * (1 - SLIPPAGE_RATE)
+    gross = position["shares"] * price
     commission = gross * COMMISSION_RATE
     net = gross - commission
     pnl = net - position["entry_total_cost"]
     ret = pnl / position["entry_total_cost"] * 100
+
     state["cash"] += net
     state["realized_pnl"] += pnl
     state["trades"].append({
         "symbol": symbol,
         "entry_time": position["entry_time"],
-        "exit_time": timestamp.isoformat(),
+        "exit_time": pd.Timestamp(timestamp).isoformat(),
         "entry_price": position["entry_price"],
-        "exit_price": execution_price,
+        "exit_price": price,
         "pnl": pnl,
         "return_percent": ret,
         "reason": reason,
     })
-    state["positions"][symbol] = blank_position()
+    state["positions"][symbol] = fresh_position()
 
 
-def simulate_day(selected_date_text):
-    selected_date = date.fromisoformat(selected_date_text)
-    state = fresh_state()
-    day_data = {}
-    for symbol in SYMBOLS:
-        raw = add_indicators(download_data(symbol))
-        day_data[symbol] = day_slice(raw, selected_date)
+def replay_prices_at(timestamp):
+    prices = {}
+    for symbol, data in REPLAY["data"].items():
+        rows = data.loc[:timestamp]
+        if not rows.empty:
+            prices[symbol] = float(rows.iloc[-1]["Close"])
+    return prices
 
-    available = [frame for frame in day_data.values() if not frame.empty]
-    if not available:
-        return {
-            "ok": False,
-            "date": selected_date_text,
-            "message": "No regular-session 5-minute candles are available for this date.",
-        }
 
-    all_times = sorted(set().union(*(set(frame.index) for frame in available)))
-    latest_prices = {}
-    equity = []
+def advance_replay(steps=1):
+    if REPLAY["state"] is None or not REPLAY["timeline"]:
+        return
 
-    for timestamp in all_times:
-        for symbol in SYMBOLS:
-            frame = day_data[symbol]
-            if timestamp not in frame.index:
+    for _ in range(max(1, int(steps))):
+        if REPLAY["step"] >= len(REPLAY["timeline"]) - 1:
+            REPLAY["playing"] = False
+            break
+
+        REPLAY["step"] += 1
+        timestamp = REPLAY["timeline"][REPLAY["step"]]
+        state = REPLAY["state"]
+        prices = replay_prices_at(timestamp)
+
+        # 1) Pending signals fill at this candle's open.
+        for symbol, data in REPLAY["data"].items():
+            if timestamp not in data.index:
                 continue
-            row = frame.loc[timestamp]
+            row = data.loc[timestamp]
             position = state["positions"][symbol]
-            pending = position["pending_order"]
-            if pending is not None and pd.Timestamp(pending["signal_time"]) < timestamp:
-                if pending["side"] == "BUY":
-                    sim_execute_buy(state, symbol, timestamp, float(row["Open"]), latest_prices)
-                elif pending["side"] == "SELL":
-                    sim_execute_sell(state, symbol, timestamp, float(row["Open"]), "signal")
-                state["positions"][symbol]["pending_order"] = None
+            pending = position.get("pending_order")
+            if pending == "BUY":
+                execute_replay_buy(state, symbol, timestamp, float(row["Open"]), portfolio_value(state, prices))
+            elif pending == "SELL":
+                execute_replay_sell(state, symbol, timestamp, float(row["Open"]), "signal")
 
-        for symbol in SYMBOLS:
-            frame = day_data[symbol]
-            if timestamp not in frame.index:
+        # 2) Stop loss inside this candle.
+        for symbol, data in REPLAY["data"].items():
+            if timestamp not in data.index:
                 continue
-            row = frame.loc[timestamp]
-            close = float(row["Close"])
-            latest_prices[symbol] = close
+            row = data.loc[timestamp]
             position = state["positions"][symbol]
-            if position["shares"] > 0 and position["stop_price"] is not None and close <= position["stop_price"]:
-                sim_execute_sell(state, symbol, timestamp, close, "stop_loss")
+            stop = position.get("stop_price")
+            if position["shares"] > 0 and stop is not None and float(row["Low"]) <= float(stop):
+                execute_replay_sell(state, symbol, timestamp, float(stop), "stop_loss")
 
-        for symbol in SYMBOLS:
-            frame = day_data[symbol]
-            if timestamp not in frame.index:
+        # 3) Generate signals from the completed candle.
+        for symbol, data in REPLAY["data"].items():
+            if timestamp not in data.index:
                 continue
-            row = frame.loc[timestamp]
+            history = data.loc[:timestamp]
+            if len(history) < 201:
+                continue
             position = state["positions"][symbol]
-            signal = strategy_signal(row, position["shares"] > 0)
+            signal = strategy_signal(history, position["shares"] > 0)
             if signal in {"BUY", "SELL"}:
-                position["pending_order"] = {"side": signal, "signal_time": timestamp.isoformat()}
+                position["pending_order"] = signal
 
-        equity.append({
-            "timestamp": timestamp.isoformat(),
-            "portfolio_value": portfolio_value(state, latest_prices),
-            "cash": state["cash"],
-            "realized_pnl": state["realized_pnl"],
-            "unrealized_pnl": unrealized_pnl(state, latest_prices),
-            "open_positions": position_count(state),
+        prices = replay_prices_at(timestamp)
+        REPLAY["equity"].append({
+            "timestamp": pd.Timestamp(timestamp).isoformat(),
+            "portfolio_value": portfolio_value(state, prices),
         })
 
-    final_prices = {}
-    stock_data = {}
-    for symbol, frame in day_data.items():
-        if frame.empty:
-            continue
-        final_prices[symbol] = float(frame.iloc[-1]["Close"])
-        stock_data[symbol] = [
-            {
-                "timestamp": ts.isoformat(),
-                "close": float(row["Close"]),
-                "ma20": None if pd.isna(row["MA20"]) else float(row["MA20"]),
-                "ma50": None if pd.isna(row["MA50"]) else float(row["MA50"]),
-            }
-            for ts, row in frame.iterrows()
-        ]
 
-    return {
-        "ok": True,
-        "date": selected_date_text,
-        "state": state,
-        "prices": final_prices,
-        "equity": equity,
-        "trades": state["trades"],
-        "stock_data": stock_data,
+# ==========================================
+# UI HELPERS
+# ==========================================
+
+
+def panel(children, **extra):
+    style = {
+        "background": SURFACE,
+        "border": f"1px solid {BORDER}",
+        "borderRadius": RADIUS,
+        "padding": SPACE,
     }
+    style.update(extra.pop("style", {}))
+    return html.Div(children, style=style, **extra)
 
 
-def market_status(timestamps):
-    now_ny = datetime.now(NY)
-    if not timestamps:
-        return "NO DATA", RED, "No market data available"
-    latest = max(timestamps.values())
-    if latest.date() != now_ny.date():
-        return "MARKET CLOSED", MUTED, f"Last candle {latest.strftime('%a %H:%M ET')}"
-    if now_ny.weekday() >= 5:
-        return "MARKET CLOSED", MUTED, f"Last candle {latest.strftime('%H:%M ET')}"
-    minutes = now_ny.hour * 60 + now_ny.minute
-    if 570 <= minutes < 960:
-        return "MARKET OPEN", GREEN, f"Latest data {latest.strftime('%H:%M ET')}"
-    return "MARKET CLOSED", MUTED, f"Last candle {latest.strftime('%H:%M ET')}"
-
-
-def bot_status():
-    if not STATE_FILE.exists():
-        return "BOT WAITING", YELLOW
-    age = time.time() - STATE_FILE.stat().st_mtime
-    if age <= 100:
-        return "BOT LIVE", GREEN
-    if age <= 240:
-        return "BOT STALE", YELLOW
-    return "BOT OFFLINE", RED
-
-
-def metric(label, value, accent=TEXT):
+def metric(label, value, color=TEXT):
     return html.Div([
-        html.Div(label, style={"fontSize": "11px", "color": MUTED}),
-        html.Div(value, style={"fontSize": "22px", "fontWeight": "700", "color": accent, "marginTop": "5px"}),
-    ], style={"background": PANEL, "border": f"1px solid {BORDER}", "borderRadius": "10px", "padding": "14px 16px"})
+        html.Div(label, style={"fontSize": "12px", "color": MUTED, "marginBottom": "6px"}),
+        html.Div(value, style={"fontSize": "22px", "fontWeight": "650", "color": color}),
+    ])
 
 
 def badge(text, color):
-    return html.Span(text, style={
-        "fontSize": "11px", "fontWeight": "700", "color": color,
-        "border": f"1px solid {color}", "borderRadius": "999px", "padding": "5px 9px"
-    })
+    return html.Span(
+        text,
+        style={
+            "fontSize": "11px",
+            "fontWeight": "700",
+            "color": color,
+            "border": f"1px solid {BORDER}",
+            "background": SURFACE_2,
+            "borderRadius": "999px",
+            "padding": "5px 8px",
+        },
+    )
 
 
-def base_figure(height=330):
+def empty_figure():
     fig = go.Figure()
     fig.update_layout(
-        paper_bgcolor=PANEL,
-        plot_bgcolor=PANEL,
-        font={"color": MUTED, "family": "Inter, system-ui, sans-serif", "size": 11},
-        margin={"l": 42, "r": 16, "t": 20, "b": 36},
+        paper_bgcolor=SURFACE,
+        plot_bgcolor=SURFACE,
+        font={"family": FONT, "color": TEXT, "size": 12},
+        margin={"l": 45, "r": 16, "t": 20, "b": 36},
         xaxis={"gridcolor": BORDER, "zeroline": False},
         yaxis={"gridcolor": BORDER, "zeroline": False},
-        height=height,
+        height=330,
         hovermode="x unified",
+        showlegend=False,
     )
     return fig
 
 
-def portfolio_chart(equity):
-    fig = base_figure()
-    if not equity:
-        return fig
-    data = pd.DataFrame(equity)
-    data["timestamp"] = pd.to_datetime(data["timestamp"], errors="coerce")
-    fig.add_trace(go.Scatter(
-        x=data["timestamp"], y=data["portfolio_value"], mode="lines",
-        line={"color": BLUE, "width": 2}, name="Portfolio"
-    ))
-    fig.add_hline(y=STARTING_CASH, line_dash="dot", line_color="#4c5360")
-    fig.update_layout(showlegend=False)
+def portfolio_figure(rows):
+    fig = empty_figure()
+    if rows:
+        df = pd.DataFrame(rows)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        fig.add_trace(go.Scatter(
+            x=df["timestamp"],
+            y=df["portfolio_value"],
+            mode="lines",
+            line={"color": ACCENT, "width": 2},
+            name="Portfolio",
+        ))
+    fig.add_hline(y=STARTING_CASH, line_dash="dot", line_color=MUTED)
     return fig
 
 
-def stock_chart_from_frame(symbol, data, state, trades_df):
-    fig = base_figure()
+def live_stock_figure(symbol, trades_df):
+    fig = empty_figure()
+    try:
+        data = download_live(symbol)
+    except Exception:
+        return fig
     if data.empty:
         return fig
-    fig.add_trace(go.Scatter(x=data.index, y=data["Close"], mode="lines", name="Price", line={"color": TEXT, "width": 2}))
-    if "MA20" in data:
-        fig.add_trace(go.Scatter(x=data.index, y=data["MA20"], mode="lines", name="MA20", line={"color": BLUE, "width": 1}, opacity=0.7))
-    if "MA50" in data:
-        fig.add_trace(go.Scatter(x=data.index, y=data["MA50"], mode="lines", name="MA50", line={"color": YELLOW, "width": 1}, opacity=0.7))
+
+    data = data.tail(160)
+    fig.add_trace(go.Scatter(x=data.index, y=data["Close"], mode="lines", line={"color": TEXT, "width": 2}))
+
     if not trades_df.empty and "symbol" in trades_df.columns:
-        symbol_trades = trades_df[trades_df["symbol"] == symbol]
-        if not symbol_trades.empty:
+        t = trades_df[trades_df["symbol"] == symbol]
+        if not t.empty:
             fig.add_trace(go.Scatter(
-                x=pd.to_datetime(symbol_trades["entry_time"], errors="coerce"),
-                y=symbol_trades["entry_price"], mode="markers", name="Buy",
-                marker={"symbol": "triangle-up", "size": 10, "color": GREEN}
+                x=pd.to_datetime(t["entry_time"], errors="coerce"), y=t["entry_price"], mode="markers",
+                marker={"symbol": "triangle-up", "size": 9, "color": GREEN}, name="Buy"
             ))
             fig.add_trace(go.Scatter(
-                x=pd.to_datetime(symbol_trades["exit_time"], errors="coerce"),
-                y=symbol_trades["exit_price"], mode="markers", name="Sell",
-                marker={"symbol": "triangle-down", "size": 10, "color": RED}
+                x=pd.to_datetime(t["exit_time"], errors="coerce"), y=t["exit_price"], mode="markers",
+                marker={"symbol": "triangle-down", "size": 9, "color": RED}, name="Sell"
             ))
-    position = state.get("positions", {}).get(symbol, {})
-    if float(position.get("shares", 0.0) or 0.0) > 0 and position.get("entry_price") is not None:
-        fig.add_hline(y=float(position["entry_price"]), line_dash="dash", line_color=GREEN)
-    fig.update_layout(legend={"orientation": "h", "x": 0, "y": 1.08})
     return fig
 
 
-def live_stock_chart(symbol, state, trades_df):
-    try:
-        data = add_indicators(download_data(symbol, period="5d"))
-    except Exception:
-        return base_figure()
-    return stock_chart_from_frame(symbol, data, state, trades_df)
+def replay_stock_figure(symbol):
+    fig = empty_figure()
+    if REPLAY["state"] is None or symbol not in REPLAY["data"] or REPLAY["step"] < 0:
+        return fig
 
+    end_ts = REPLAY["timeline"][REPLAY["step"]]
+    selected_date = pd.Timestamp(REPLAY["date"]).date()
+    data = REPLAY["data"][symbol]
+    visible = data[(data.index <= end_ts) & (pd.Index(data.index).date == selected_date)]
+    if visible.empty:
+        return fig
 
-def simulation_stock_frame(sim_data, symbol):
-    rows = sim_data.get("stock_data", {}).get(symbol, [])
-    if not rows:
-        return pd.DataFrame()
-    frame = pd.DataFrame(rows)
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"])
-    frame = frame.set_index("timestamp")
-    return frame.rename(columns={"close": "Close", "ma20": "MA20", "ma50": "MA50"})
+    fig.add_trace(go.Scatter(x=visible.index, y=visible["Close"], mode="lines", line={"color": TEXT, "width": 2}))
+
+    trades = [t for t in REPLAY["state"]["trades"] if t["symbol"] == symbol]
+    if trades:
+        t = pd.DataFrame(trades)
+        fig.add_trace(go.Scatter(
+            x=pd.to_datetime(t["entry_time"]), y=t["entry_price"], mode="markers",
+            marker={"symbol": "triangle-up", "size": 9, "color": GREEN}
+        ))
+        fig.add_trace(go.Scatter(
+            x=pd.to_datetime(t["exit_time"]), y=t["exit_price"], mode="markers",
+            marker={"symbol": "triangle-down", "size": 9, "color": RED}
+        ))
+    return fig
 
 
 def positions_rows(state, prices):
     rows = []
     for symbol in SYMBOLS:
-        position = state.get("positions", {}).get(symbol, {})
-        shares = float(position.get("shares", 0.0) or 0.0)
+        p = state.get("positions", {}).get(symbol, {})
+        shares = float(p.get("shares", 0) or 0)
         if shares <= 0:
             continue
         current = prices.get(symbol)
-        entry_cost = position.get("entry_total_cost")
-        value = shares * current if current is not None else None
-        pnl = value - float(entry_cost) if value is not None and entry_cost is not None else None
+        cost = p.get("entry_total_cost")
+        pnl = None if current is None or cost is None else shares * current - float(cost)
         rows.append({
             "Symbol": symbol,
-            "Value": None if value is None else round(value, 2),
+            "Value": None if current is None else round(shares * current, 2),
             "P/L": None if pnl is None else round(pnl, 2),
-            "Entry": position.get("entry_price"),
-            "Stop": position.get("stop_price"),
+            "Entry": None if p.get("entry_price") is None else round(float(p["entry_price"]), 2),
         })
     return rows
 
 
-def live_activity(limit=6):
-    if not LOG_FILE.exists():
-        return []
-    try:
-        lines = LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()
-    except OSError:
-        return []
-    events = []
-    for line in reversed(lines):
-        if " BUY " not in line and " SELL " not in line and "BUY BLOCKED" not in line:
-            continue
-        events.append(line.split(" | ")[-1])
-        if len(events) >= limit:
-            break
-    return events
-
-
-def activity_components(events):
-    if not events:
-        return [html.Div("No trades yet", style={"color": MUTED, "fontSize": "13px"})]
-    result = []
-    for event in events:
-        color = GREEN if event.startswith("BUY ") else RED if event.startswith("SELL ") else YELLOW
-        result.append(html.Div(
-            event,
-            style={
-                "fontSize": "12px", "color": TEXT, "padding": "8px 0",
-                "borderBottom": f"1px solid {BORDER}", "borderLeft": f"2px solid {color}",
-                "paddingLeft": "10px"
-            }
-        ))
-    return result
+# ==========================================
+# DASH APP
+# ==========================================
 
 
 app = Dash(__name__)
 app.title = "Quant Bot"
 
-TABLE_STYLE = {
+CONTROL_STYLE = {
+    "height": "36px",
+    "borderRadius": "8px",
+    "border": f"1px solid {BORDER}",
+    "background": SURFACE_2,
+    "color": TEXT,
+    "fontFamily": FONT,
+}
+BUTTON_STYLE = {
+    **CONTROL_STYLE,
+    "padding": "0 12px",
+    "cursor": "pointer",
+    "fontWeight": "600",
+}
+TABLE = {
     "style_table": {"overflowX": "auto"},
     "style_cell": {
-        "backgroundColor": PANEL, "color": TEXT, "border": "none",
-        "borderBottom": f"1px solid {BORDER}", "padding": "9px 6px",
-        "fontFamily": "Inter, system-ui, sans-serif", "fontSize": "12px", "textAlign": "left"
+        "backgroundColor": SURFACE,
+        "color": TEXT,
+        "border": "none",
+        "borderBottom": f"1px solid {BORDER}",
+        "padding": "9px 6px",
+        "fontFamily": FONT,
+        "fontSize": "12px",
+        "textAlign": "left",
     },
     "style_header": {
-        "backgroundColor": PANEL, "color": MUTED, "fontWeight": "600",
-        "border": "none", "borderBottom": f"1px solid {BORDER}"
+        "backgroundColor": SURFACE,
+        "color": MUTED,
+        "border": "none",
+        "borderBottom": f"1px solid {BORDER}",
+        "fontWeight": "600",
     },
-}
-
-BUTTON_STYLE = {
-    "height": "36px", "background": TEXT, "color": BG, "border": "none",
-    "borderRadius": "7px", "padding": "0 14px", "fontWeight": "700", "cursor": "pointer"
 }
 
 app.layout = html.Div(
-    style={"minHeight": "100vh", "background": BG, "color": TEXT, "fontFamily": "Inter, system-ui, sans-serif", "padding": "22px"},
+    style={"minHeight": "100vh", "background": BG, "color": TEXT, "fontFamily": FONT},
     children=[
-        dcc.Interval(id="refresh", interval=REFRESH_MS, n_intervals=0),
-        dcc.Store(id="simulation-store"),
+        dcc.Interval(id="live-refresh", interval=15_000, n_intervals=0),
+        dcc.Interval(id="replay-tick", interval=1000, n_intervals=0),
+        dcc.Store(id="replay-version", data=0),
 
         html.Div(
-            style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "gap": "16px", "flexWrap": "wrap", "marginBottom": "18px"},
+            style={"maxWidth": "1180px", "margin": "0 auto", "padding": "28px 20px 48px"},
             children=[
-                html.Div([
-                    html.H1("Quant Bot", style={"margin": 0, "fontSize": "24px", "fontWeight": "700"}),
-                    html.Div("5-minute paper trading", style={"fontSize": "12px", "color": MUTED, "marginTop": "3px"}),
-                ]),
-                html.Div(id="status-area", style={"display": "flex", "gap": "8px", "alignItems": "center", "flexWrap": "wrap"}),
-            ],
-        ),
+                html.Div(
+                    style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "gap": SPACE, "marginBottom": "20px"},
+                    children=[
+                        html.Div([
+                            html.Div("QUANT BOT", style={"fontSize": "11px", "fontWeight": "700", "letterSpacing": "0.12em", "color": MUTED}),
+                            html.H1("Paper portfolio", style={"fontSize": "26px", "fontWeight": "650", "margin": "4px 0 0"}),
+                        ]),
+                        html.Div(id="header-status", style={"display": "flex", "gap": "8px", "alignItems": "center"}),
+                    ],
+                ),
 
-        html.Div(
-            style={"display": "flex", "gap": "10px", "alignItems": "end", "flexWrap": "wrap", "marginBottom": "18px", "padding": "12px", "background": PANEL, "border": f"1px solid {BORDER}", "borderRadius": "10px"},
-            children=[
-                html.Div([
-                    html.Div("Mode", style={"fontSize": "10px", "color": MUTED, "marginBottom": "6px"}),
-                    dcc.RadioItems(
-                        id="view-mode",
-                        options=[{"label": " Live", "value": "live"}, {"label": " Simulate", "value": "simulate"}],
-                        value="live", inline=True,
-                        style={"fontSize": "13px", "display": "flex", "gap": "12px"},
-                    ),
-                ]),
-                html.Div([
-                    html.Div("Trading day", style={"fontSize": "10px", "color": MUTED, "marginBottom": "6px"}),
-                    dcc.DatePickerSingle(
-                        id="simulation-date",
-                        date=date.today().isoformat(),
-                        max_date_allowed=date.today().isoformat(),
-                        display_format="YYYY-MM-DD",
-                    ),
-                ], id="date-control"),
-                html.Button("Run simulation", id="run-simulation", n_clicks=0, style=BUTTON_STYLE),
-                html.Div(id="simulation-message", style={"fontSize": "12px", "color": MUTED, "paddingBottom": "8px"}),
-            ],
-        ),
-
-        html.Div(id="metrics", style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit, minmax(145px, 1fr))", "gap": "10px", "marginBottom": "14px"}),
-
-        html.Div(
-            style={"display": "grid", "gridTemplateColumns": "minmax(0, 1fr) minmax(0, 1fr)", "gap": "14px", "marginBottom": "14px"},
-            children=[
-                html.Div([
-                    html.Div("Portfolio", style={"fontSize": "12px", "color": MUTED, "padding": "12px 14px 0"}),
-                    dcc.Graph(id="portfolio-chart", config={"displayModeBar": False}),
-                ], style={"background": PANEL, "border": f"1px solid {BORDER}", "borderRadius": "10px", "overflow": "hidden"}),
-                html.Div([
+                panel([
                     html.Div(
-                        style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "padding": "10px 12px 0"},
+                        style={"display": "flex", "gap": "10px", "alignItems": "center", "flexWrap": "wrap"},
                         children=[
-                            html.Div("Price", style={"fontSize": "12px", "color": MUTED}),
-                            dcc.Dropdown(
-                                id="symbol-dropdown",
-                                options=[{"label": s, "value": s} for s in SYMBOLS],
-                                value="AAPL", clearable=False,
-                                style={"width": "120px", "color": "#111"},
+                            dcc.RadioItems(
+                                id="mode",
+                                options=[{"label": "Live", "value": "live"}, {"label": "Replay", "value": "replay"}],
+                                value="live",
+                                inline=True,
+                                inputStyle={"marginRight": "5px"},
+                                labelStyle={"marginRight": "14px", "fontSize": "13px", "color": TEXT},
                             ),
+                            dcc.DatePickerSingle(
+                                id="replay-date",
+                                date=datetime.now().date().isoformat(),
+                                max_date_allowed=datetime.now().date(),
+                                display_format="YYYY-MM-DD",
+                            ),
+                            html.Button("Load", id="load-replay", n_clicks=0, style=BUTTON_STYLE),
+                            html.Button("▶", id="play-replay", n_clicks=0, style=BUTTON_STYLE),
+                            html.Button("Ⅱ", id="pause-replay", n_clicks=0, style=BUTTON_STYLE),
+                            html.Button("→", id="next-replay", n_clicks=0, style=BUTTON_STYLE),
+                            dcc.Dropdown(
+                                id="replay-speed",
+                                options=[{"label": "1x", "value": 1}, {"label": "5x", "value": 5}, {"label": "20x", "value": 20}],
+                                value=1,
+                                clearable=False,
+                                style={"width": "90px", "color": "#111"},
+                            ),
+                            html.Div(id="replay-status", style={"marginLeft": "auto", "fontSize": "12px", "color": MUTED}),
                         ],
-                    ),
-                    dcc.Graph(id="stock-chart", config={"displayModeBar": False}),
-                ], style={"background": PANEL, "border": f"1px solid {BORDER}", "borderRadius": "10px", "overflow": "hidden"}),
-            ],
-        ),
+                    )
+                ], style={"marginBottom": SPACE}),
 
-        html.Div(
-            style={"display": "grid", "gridTemplateColumns": "minmax(0, 1.2fr) minmax(260px, 0.8fr)", "gap": "14px"},
-            children=[
-                html.Div([
-                    html.Div("Positions", style={"fontSize": "12px", "color": MUTED, "marginBottom": "8px"}),
-                    dash_table.DataTable(id="positions-table", **TABLE_STYLE),
-                ], style={"background": PANEL, "border": f"1px solid {BORDER}", "borderRadius": "10px", "padding": "12px"}),
-                html.Div([
-                    html.Div("Activity", style={"fontSize": "12px", "color": MUTED, "marginBottom": "4px"}),
-                    html.Div(id="activity"),
-                ], style={"background": PANEL, "border": f"1px solid {BORDER}", "borderRadius": "10px", "padding": "12px"}),
+                panel(
+                    html.Div(id="metrics", style={"display": "grid", "gridTemplateColumns": "repeat(6, minmax(0, 1fr))", "gap": "18px"}),
+                    style={"marginBottom": SPACE},
+                ),
+
+                html.Div(
+                    style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": SPACE, "marginBottom": SPACE},
+                    children=[
+                        panel([
+                            html.Div("Portfolio", style={"fontSize": "12px", "fontWeight": "600", "color": MUTED, "marginBottom": "6px"}),
+                            dcc.Graph(id="portfolio-chart", config={"displayModeBar": False}, style={"height": "330px"}),
+                        ]),
+                        panel([
+                            html.Div(
+                                style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "6px"},
+                                children=[
+                                    html.Div("Price", style={"fontSize": "12px", "fontWeight": "600", "color": MUTED}),
+                                    dcc.Dropdown(
+                                        id="symbol",
+                                        options=[{"label": s, "value": s} for s in SYMBOLS],
+                                        value="AAPL",
+                                        clearable=False,
+                                        style={"width": "110px", "color": "#111"},
+                                    ),
+                                ],
+                            ),
+                            dcc.Graph(id="stock-chart", config={"displayModeBar": False}, style={"height": "330px"}),
+                        ]),
+                    ],
+                ),
+
+                html.Div(
+                    style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": SPACE},
+                    children=[
+                        panel([
+                            html.Div("Open positions", style={"fontSize": "12px", "fontWeight": "600", "color": MUTED, "marginBottom": "8px"}),
+                            dash_table.DataTable(id="positions", page_size=6, **TABLE),
+                        ]),
+                        panel([
+                            html.Div("Recent trades", style={"fontSize": "12px", "fontWeight": "600", "color": MUTED, "marginBottom": "8px"}),
+                            dash_table.DataTable(id="trades", page_size=6, **TABLE),
+                        ]),
+                    ],
+                ),
             ],
         ),
     ],
 )
 
 
+# ==========================================
+# CALLBACKS
+# ==========================================
+
+
 @app.callback(
-    Output("simulation-store", "data"),
-    Output("simulation-message", "children"),
-    Input("run-simulation", "n_clicks"),
-    State("simulation-date", "date"),
+    Output("replay-version", "data"),
+    Output("replay-status", "children"),
+    Input("load-replay", "n_clicks"),
+    Input("play-replay", "n_clicks"),
+    Input("pause-replay", "n_clicks"),
+    Input("next-replay", "n_clicks"),
+    Input("replay-speed", "value"),
+    Input("replay-tick", "n_intervals"),
+    State("replay-date", "date"),
+    State("mode", "value"),
     prevent_initial_call=True,
 )
-def run_simulation_callback(_, selected_date):
-    if not selected_date:
-        return no_update, "Select a date first."
-    try:
-        result = simulate_day(selected_date)
-    except Exception as error:
-        return None, f"Simulation failed: {error}"
-    if not result.get("ok"):
-        return result, result.get("message", "No data for that day.")
-    return result, f"Simulated {selected_date} · {len(result.get('trades', []))} completed trade(s)"
+def control_replay(load_clicks, play_clicks, pause_clicks, next_clicks, speed, tick, date_text, mode):
+    trigger = ctx.triggered_id
+    REPLAY["speed"] = speed or 1
+
+    if trigger == "load-replay":
+        load_replay_day(date_text)
+    elif trigger == "play-replay" and REPLAY["state"] is not None:
+        REPLAY["playing"] = True
+    elif trigger == "pause-replay":
+        REPLAY["playing"] = False
+    elif trigger == "next-replay" and mode == "replay":
+        advance_replay(1)
+    elif trigger == "replay-tick" and mode == "replay" and REPLAY["playing"]:
+        advance_replay(REPLAY["speed"])
+
+    if REPLAY["error"]:
+        status = REPLAY["error"]
+    elif REPLAY["state"] is None:
+        status = "Choose a date and load replay"
+    elif REPLAY["step"] < 0:
+        status = f"{REPLAY['date']} · ready"
+    else:
+        ts = REPLAY["timeline"][REPLAY["step"]]
+        status = f"{pd.Timestamp(ts).strftime('%H:%M')} · {REPLAY['step'] + 1}/{len(REPLAY['timeline'])}"
+        if REPLAY["playing"]:
+            status += f" · playing {REPLAY['speed']}x"
+
+    return time.time(), status
 
 
 @app.callback(
-    Output("status-area", "children"),
+    Output("header-status", "children"),
     Output("metrics", "children"),
     Output("portfolio-chart", "figure"),
     Output("stock-chart", "figure"),
-    Output("positions-table", "data"),
-    Output("positions-table", "columns"),
-    Output("activity", "children"),
-    Output("date-control", "style"),
-    Output("run-simulation", "style"),
-    Input("refresh", "n_intervals"),
-    Input("view-mode", "value"),
-    Input("simulation-store", "data"),
-    Input("symbol-dropdown", "value"),
+    Output("positions", "data"),
+    Output("positions", "columns"),
+    Output("trades", "data"),
+    Output("trades", "columns"),
+    Input("live-refresh", "n_intervals"),
+    Input("replay-version", "data"),
+    Input("mode", "value"),
+    Input("symbol", "value"),
 )
-def render_dashboard(_, mode, simulation, symbol):
-    if mode == "simulate":
-        date_style = {"display": "block"}
-        button_style = BUTTON_STYLE
-        if not simulation or not simulation.get("ok"):
-            state = fresh_state()
-            prices = {}
-            equity = []
-            trades_df = pd.DataFrame()
-            status = [badge("SIMULATION", BLUE)]
-            events = []
-        else:
-            state = simulation["state"]
-            prices = simulation.get("prices", {})
-            equity = simulation.get("equity", [])
-            trades_df = pd.DataFrame(simulation.get("trades", []))
-            status = [badge(f"SIM · {simulation['date']}", BLUE)]
-            events = [
-                f"{trade['symbol']} SELL · P/L ${trade['pnl']:+.2f} · {trade['reason']}"
-                for trade in reversed(simulation.get("trades", []))
-            ][:6]
-        stock_fig = stock_chart_from_frame(symbol, simulation_stock_frame(simulation or {}, symbol), state, trades_df)
-        portfolio_fig = portfolio_chart(equity)
+def render_dashboard(_refresh, _replay_version, mode, symbol):
+    if mode == "replay" and REPLAY["state"] is not None:
+        state = REPLAY["state"]
+        prices = {}
+        if REPLAY["step"] >= 0:
+            prices = replay_prices_at(REPLAY["timeline"][REPLAY["step"]])
+        value = portfolio_value(state, prices)
+        unrealized = unrealized_pnl(state, prices)
+        total_pnl = value - STARTING_CASH
+        trades_df = pd.DataFrame(state["trades"])
+        equity_rows = REPLAY["equity"]
+        stock_fig = replay_stock_figure(symbol)
+        status_children = [badge("REPLAY", ACCENT)]
     else:
-        date_style = {"display": "none"}
-        button_style = {**BUTTON_STYLE, "display": "none"}
         state = read_state()
-        prices, timestamps = latest_prices_and_times()
-        equity_df = read_csv(EQUITY_FILE)
-        equity = equity_df.to_dict("records") if not equity_df.empty else []
+        prices = latest_live_prices()
+        value = portfolio_value(state, prices)
+        unrealized = unrealized_pnl(state, prices)
+        total_pnl = value - STARTING_CASH
         trades_df = read_csv(TRADES_FILE)
-        market_text, market_color, market_note = market_status(timestamps)
-        bot_text, bot_color = bot_status()
-        status = [
-            badge(market_text, market_color),
-            badge(bot_text, bot_color),
-            html.Span(market_note, style={"fontSize": "11px", "color": MUTED}),
-        ]
-        events = live_activity()
-        portfolio_fig = portfolio_chart(equity)
-        stock_fig = live_stock_chart(symbol, state, trades_df)
+        equity_df = read_csv(EQUITY_FILE)
+        equity_rows = equity_df.to_dict("records") if not equity_df.empty else []
+        stock_fig = live_stock_figure(symbol, trades_df)
+        market_text, market_color, market_note = market_status()
+        age = None
+        if STATE_FILE.exists():
+            age = max(0, int(time.time() - STATE_FILE.stat().st_mtime))
+        bot_text = "LIVE" if age is not None and age <= 90 else "STALE" if age is not None and age <= 240 else "OFFLINE"
+        bot_color = GREEN if bot_text == "LIVE" else YELLOW if bot_text == "STALE" else MUTED
+        status_children = [badge(f"MARKET {market_text}", market_color), badge(f"BOT {bot_text}", bot_color)]
 
-    value = portfolio_value(state, prices)
-    total_pnl = value - STARTING_CASH
-    realized = float(state.get("realized_pnl", 0.0))
-    unrealized = unrealized_pnl(state, prices)
     return_pct = total_pnl / STARTING_CASH * 100
+    realized = float(state.get("realized_pnl", 0.0))
 
-    cards = [
+    metrics = [
         metric("Account", f"${value:,.2f}"),
         metric("Cash", f"${float(state.get('cash', 0)):,.2f}"),
-        metric("P/L", f"${total_pnl:+,.2f}", pnl_color(total_pnl)),
+        metric("Total P/L", f"${total_pnl:+,.2f}", pnl_color(total_pnl)),
         metric("Return", f"{return_pct:+.2f}%", pnl_color(return_pct)),
         metric("Realized", f"${realized:+,.2f}", pnl_color(realized)),
         metric("Unrealized", f"${unrealized:+,.2f}", pnl_color(unrealized)),
-        metric("Positions", f"{position_count(state)}/{MAX_OPEN_POSITIONS}"),
-        metric("Trades", str(len(state.get("trades", [])))),
     ]
 
-    rows = positions_rows(state, prices)
-    columns = [{"name": key, "id": key} for key in rows[0].keys()] if rows else []
+    pos_rows = positions_rows(state, prices)
+    pos_cols = [{"name": c, "id": c} for c in ["Symbol", "Value", "P/L", "Entry"]]
+
+    if trades_df.empty:
+        trade_rows = []
+        trade_cols = [{"name": c, "id": c} for c in ["symbol", "exit_time", "pnl", "reason"]]
+    else:
+        cols = [c for c in ["symbol", "exit_time", "pnl", "reason"] if c in trades_df.columns]
+        trade_rows = trades_df.tail(6).iloc[::-1][cols].to_dict("records")
+        trade_cols = [{"name": c.replace("_", " ").title(), "id": c} for c in cols]
 
     return (
-        status, cards, portfolio_fig, stock_fig, rows, columns,
-        activity_components(events), date_style, button_style,
+        status_children,
+        metrics,
+        portfolio_figure(equity_rows),
+        stock_fig,
+        pos_rows,
+        pos_cols,
+        trade_rows,
+        trade_cols,
     )
 
 
+# ==========================================
+# START
+# ==========================================
+
+
 def open_browser():
-    webbrowser.open("http://127.0.0.1:8050/")
+    webbrowser.open("http://127.0.0.1:8050")
 
 
 if __name__ == "__main__":
