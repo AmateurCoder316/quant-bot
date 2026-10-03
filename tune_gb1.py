@@ -7,6 +7,7 @@ import pandas as pd
 from features import FEATURE_COLUMNS
 from market_data import LOCAL_PROVIDER
 from strategy_core import COMMISSION_RATE, SLIPPAGE_RATE, SYMBOLS
+from train_gb1 import MODEL_INPUT_COLUMNS, add_symbol_columns
 from tune_lr1 import build_trade_candidates as build_fixed_candidates
 from tune_lr1 import metrics_from_trades, run_portfolio
 from tune_lr2 import add_adaptive_threshold, build_trade_candidates as build_adaptive_candidates
@@ -15,7 +16,6 @@ from tune_lr2 import add_adaptive_threshold, build_trade_candidates as build_ada
 DATASET_PATH = Path("data") / "ml" / "features.parquet"
 MODEL_PATH = Path("data") / "models" / "gb1.joblib"
 CONFIG_PATH = Path("data") / "models" / "gb1_execution.json"
-MODEL_INPUT_COLUMNS = list(FEATURE_COLUMNS) + ["symbol"]
 
 FIXED_THRESHOLDS = [0.65, 0.70, 0.72, 0.74, 0.76, 0.78, 0.80]
 ADAPTIVE_PERCENTILES = [0.95, 0.975, 0.99]
@@ -31,8 +31,15 @@ def load_validation_predictions():
     validation = dataset.loc[dataset["split"] == "validation"].copy()
     validation["timestamp"] = pd.to_datetime(validation["timestamp"], utc=True)
 
+    # GB1 was trained on the 31 numeric features plus five one-hot symbol columns.
+    # Recreate that exact input matrix before asking the model for probabilities.
+    validation_for_model = add_symbol_columns(validation)
+
     model = joblib.load(MODEL_PATH)
-    validation["probability"] = model.predict_proba(validation[MODEL_INPUT_COLUMNS])[:, 1]
+    validation["probability"] = model.predict_proba(
+        validation_for_model[MODEL_INPUT_COLUMNS]
+    )[:, 1]
+
     return validation[["timestamp", "symbol", "probability"]]
 
 
