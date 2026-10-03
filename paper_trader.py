@@ -8,26 +8,30 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-import yfinance as yf
+
+from market_data import DEFAULT_PROVIDER
+from strategy_core import (
+    COMMISSION_RATE,
+    INTERVAL,
+    MAX_OPEN_POSITIONS,
+    SLIPPAGE_RATE,
+    STARTING_CASH,
+    SYMBOLS,
+    add_indicators,
+    market_session_status,
+    risk_sized_trade_value,
+    stop_price_from_atr,
+    strategy_signal,
+)
 
 
 # ==========================================
-# SECTION 1 — SETTINGS
+# SETTINGS
 # ==========================================
 
-SYMBOLS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
-INTERVAL = "5m"
 PERIOD = "60d"
 POLL_SECONDS = 60
-
-STARTING_CASH = 10000.0
-COMMISSION_RATE = 0.001
-SLIPPAGE_RATE = 0.0005
-
-# Risk controls
-POSITION_SIZE_PERCENT = 0.20
-MAX_OPEN_POSITIONS = 3
-STOP_LOSS_PERCENT = 0.05
+MIN_BARS = 205
 
 STATE_FILE = Path("paper_state_5m.json")
 LOG_DIR = Path("logs")
@@ -38,7 +42,7 @@ DASHBOARD_FILE = Path("dashboard.py")
 
 
 # ==========================================
-# SECTION 2 — LOGGING
+# LOGGING / DASHBOARD
 # ==========================================
 
 
@@ -55,124 +59,24 @@ def log_event(message):
     logging.info(message)
 
 
-# ==========================================
-# SECTION 3 — DASHBOARD PROCESS
-# ==========================================
-
-
 def launch_dashboard():
     if not DASHBOARD_FILE.exists():
         log_event("Dashboard not started: dashboard.py not found")
         return None
 
     try:
-        process = subprocess.Popen(
+        return subprocess.Popen(
             [sys.executable, str(DASHBOARD_FILE)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        log_event("Dashboard process started")
-        return process
     except Exception:
         logging.exception("Failed to launch dashboard")
         return None
 
 
 # ==========================================
-# SECTION 4 — MARKET DATA
-# ==========================================
-
-
-def download_data(symbol):
-    data = yf.download(
-        symbol,
-        period=PERIOD,
-        interval=INTERVAL,
-        auto_adjust=True,
-        progress=False,
-        prepost=False,
-    )
-
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-
-    data = data.dropna().copy()
-
-    if len(data) < 2:
-        raise ValueError(f"Not enough intraday data for {symbol}.")
-
-    return data
-
-
-def completed_bars(data):
-    return data.iloc[:-1].copy()
-
-
-# ==========================================
-# SECTION 5 — INDICATORS
-# ==========================================
-
-
-def calculate_rsi(series, period=2):
-    change = series.diff()
-    gains = change.clip(lower=0)
-    losses = -change.clip(upper=0)
-
-    average_gain = gains.ewm(alpha=1 / period, adjust=False).mean()
-    average_loss = losses.ewm(alpha=1 / period, adjust=False).mean()
-
-    rs = average_gain / average_loss.replace(0, float("nan"))
-    return (100 - (100 / (1 + rs))).fillna(100)
-
-
-def add_indicators(data):
-    data = data.copy()
-    data["MA50"] = data["Close"].rolling(50).mean()
-    data["MA200"] = data["Close"].rolling(200).mean()
-    data["High20"] = data["High"].rolling(20).max().shift(1)
-    data["Low10"] = data["Low"].rolling(10).min().shift(1)
-    data["RSI2"] = calculate_rsi(data["Close"], 2)
-    return data
-
-
-# ==========================================
-# SECTION 6 — STRATEGY
-# ==========================================
-
-
-def strategy_signal(data, has_position):
-    latest = data.iloc[-1]
-
-    if pd.isna(latest["MA200"]):
-        return "HOLD"
-
-    trend_up = latest["Close"] > latest["MA200"]
-
-    if not has_position:
-        breakout_buy = (
-            not pd.isna(latest["High20"])
-            and latest["Close"] > latest["High20"]
-        )
-        mean_reversion_buy = trend_up and latest["RSI2"] < 10
-
-        if breakout_buy or mean_reversion_buy:
-            return "BUY"
-
-    if has_position:
-        breakout_sell = (
-            not pd.isna(latest["Low10"])
-            and latest["Close"] < latest["Low10"]
-        )
-        mean_reversion_sell = latest["RSI2"] > 70
-
-        if breakout_sell or mean_reversion_sell:
-            return "SELL"
-
-    return "HOLD"
-
-
-# ==========================================
-# SECTION 7 — PERSISTENT STATE
+# STATE
 # ==========================================
 
 
@@ -182,6 +86,7 @@ def fresh_position():
         "entry_price": None,
         "entry_time": None,
         "entry_total_cost": None,
+        "entry_reason": None,
         "stop_price": None,
         "pending_order": None,
         "last_signal_bar": None,
@@ -197,6 +102,9 @@ def fresh_state():
         "realized_pnl": 0.0,
         "positions": {symbol: fresh_position() for symbol in SYMBOLS},
         "trades": [],
+        "last_prices": {},
+        "market_status": market_session_status(),
+        "last_heartbeat": datetime.now().isoformat(),
     }
 
 
@@ -204,78 +112,94 @@ def load_state():
     if not STATE_FILE.exists():
         return fresh_state()
 
-    with STATE_FILE.open("r", encoding="utf-8") as file:
-        state = json.load(file)
-
-    required_keys = {"cash", "realized_pnl", "positions", "trades"}
-    if state.get("interval") != INTERVAL or not required_keys.issubset(state):
-        log_event("Old or incompatible paper state detected; starting fresh")
+    try:
+        with STATE_FILE.open("r", encoding="utf-8") as file:
+            state = json.load(file)
+    except (json.JSONDecodeError, OSError):
+        log_event("Unreadable state file; starting fresh")
         return fresh_state()
 
+    required = {"cash", "realized_pnl", "positions", "trades"}
+    if state.get("interval") != INTERVAL or not required.issubset(state):
+        log_event("Incompatible state file; starting fresh")
+        return fresh_state()
+
+    state.setdefault("last_prices", {})
+    state.setdefault("market_status", market_session_status())
+    state.setdefault("last_heartbeat", datetime.now().isoformat())
+
     for symbol in SYMBOLS:
-        state["positions"].setdefault(symbol, fresh_position())
+        position = state["positions"].setdefault(symbol, fresh_position())
+        position.setdefault("entry_reason", None)
+        position.setdefault("pending_order", None)
+        position.setdefault("last_signal_bar", None)
 
     return state
 
 
 def save_state(state):
+    state["last_heartbeat"] = datetime.now().isoformat()
     with STATE_FILE.open("w", encoding="utf-8") as file:
         json.dump(state, file, indent=2)
 
 
 # ==========================================
-# SECTION 8 — PORTFOLIO HELPERS
+# PORTFOLIO HELPERS
 # ==========================================
 
 
 def open_position_count(state):
     return sum(
-        1
+        float(position.get("shares", 0.0) or 0.0) > 0
         for position in state["positions"].values()
-        if position["shares"] > 0
     )
 
 
-def portfolio_value(state, latest_prices):
-    value = state["cash"]
+def portfolio_value(state, prices):
+    value = float(state["cash"])
 
     for symbol, position in state["positions"].items():
-        if position["shares"] > 0 and symbol in latest_prices:
-            value += position["shares"] * latest_prices[symbol]
+        shares = float(position.get("shares", 0.0) or 0.0)
+        if shares > 0 and symbol in prices:
+            value += shares * float(prices[symbol])
 
     return value
 
 
-def unrealized_pnl(state, latest_prices):
+def unrealized_pnl(state, prices):
     total = 0.0
 
     for symbol, position in state["positions"].items():
-        if position["shares"] <= 0 or symbol not in latest_prices:
+        shares = float(position.get("shares", 0.0) or 0.0)
+        entry_cost = position.get("entry_total_cost")
+
+        if shares <= 0 or entry_cost is None or symbol not in prices:
             continue
 
-        current_value = position["shares"] * latest_prices[symbol]
-        total += current_value - position["entry_total_cost"]
+        total += shares * float(prices[symbol]) - float(entry_cost)
 
     return total
 
 
 # ==========================================
-# SECTION 9 — TRADE RECORDING
+# TRADE RECORDING
 # ==========================================
 
 
-def record_trade(state, symbol, execution_time, execution_price, pnl, return_percent, reason):
+def record_trade(state, symbol, exit_time, exit_price, pnl, return_percent, exit_reason):
     position = state["positions"][symbol]
 
     trade = {
         "symbol": symbol,
         "entry_time": position["entry_time"],
-        "exit_time": execution_time,
+        "exit_time": exit_time,
         "entry_price": position["entry_price"],
-        "exit_price": execution_price,
+        "exit_price": exit_price,
         "pnl": pnl,
         "return_percent": return_percent,
-        "reason": reason,
+        "entry_reason": position.get("entry_reason"),
+        "exit_reason": exit_reason,
+        "reason": exit_reason,
     }
 
     state["trades"].append(trade)
@@ -289,29 +213,31 @@ def record_trade(state, symbol, execution_time, execution_price, pnl, return_per
 
 
 # ==========================================
-# SECTION 10 — ORDER EXECUTION
+# ORDER EXECUTION
 # ==========================================
 
 
-def execute_buy(state, symbol, execution_time, market_open, current_portfolio_value):
+def execute_buy(state, symbol, execution_time, market_open, atr, reason, prices):
     position = state["positions"][symbol]
 
-    if position["shares"] > 0:
+    if position["shares"] > 0 or open_position_count(state) >= MAX_OPEN_POSITIONS:
         return
 
-    if open_position_count(state) >= MAX_OPEN_POSITIONS:
-        log_event(f"BUY BLOCKED {symbol}: max open positions reached")
+    execution_price = float(market_open) * (1 + SLIPPAGE_RATE)
+    value = portfolio_value(state, prices)
+
+    allocation = risk_sized_trade_value(
+        value,
+        state["cash"],
+        execution_price,
+        atr,
+    )
+
+    if allocation <= 0:
+        log_event(f"BUY BLOCKED {symbol}: risk sizing returned zero")
         return
 
-    max_allocation = current_portfolio_value * POSITION_SIZE_PERCENT
-    available_for_trade = min(state["cash"], max_allocation)
-
-    if available_for_trade <= 0:
-        log_event(f"BUY BLOCKED {symbol}: no available cash")
-        return
-
-    execution_price = market_open * (1 + SLIPPAGE_RATE)
-    trade_value = available_for_trade / (1 + COMMISSION_RATE)
+    trade_value = allocation / (1 + COMMISSION_RATE)
     commission = trade_value * COMMISSION_RATE
     shares = trade_value / execution_price
     total_cost = trade_value + commission
@@ -322,12 +248,14 @@ def execute_buy(state, symbol, execution_time, market_open, current_portfolio_va
     position["entry_price"] = execution_price
     position["entry_time"] = execution_time
     position["entry_total_cost"] = total_cost
-    position["stop_price"] = execution_price * (1 - STOP_LOSS_PERCENT)
+    position["entry_reason"] = reason
+    position["stop_price"] = stop_price_from_atr(execution_price, atr)
     position["pending_order"] = None
 
     log_event(
-        f"BUY {symbol} shares={shares:.6f} price={execution_price:.4f} "
-        f"cost={total_cost:.2f} commission={commission:.2f}"
+        f"BUY {symbol} reason={reason} shares={shares:.6f} "
+        f"price={execution_price:.4f} stop={position['stop_price']:.4f} "
+        f"cost={total_cost:.2f}"
     )
 
 
@@ -337,7 +265,7 @@ def execute_sell(state, symbol, execution_time, market_price, reason):
     if position["shares"] <= 0:
         return
 
-    execution_price = market_price * (1 - SLIPPAGE_RATE)
+    execution_price = float(market_price) * (1 - SLIPPAGE_RATE)
     gross_value = position["shares"] * execution_price
     commission = gross_value * COMMISSION_RATE
     net_value = gross_value - commission
@@ -359,15 +287,15 @@ def execute_sell(state, symbol, execution_time, market_price, reason):
     )
 
     log_event(
-        f"SELL {symbol} price={execution_price:.4f} pnl={pnl:+.2f} "
-        f"reason={reason} commission={commission:.2f}"
+        f"SELL {symbol} reason={reason} price={execution_price:.4f} "
+        f"pnl={pnl:+.2f}"
     )
 
     state["positions"][symbol] = fresh_position()
 
 
 # ==========================================
-# SECTION 11 — SIGNAL / ORDER PROCESSING
+# SIGNAL / EXECUTION PROCESSING
 # ==========================================
 
 
@@ -375,9 +303,9 @@ def timestamp_text(timestamp):
     return pd.Timestamp(timestamp).isoformat()
 
 
-def try_execute_pending_order(state, symbol, raw_data, latest_prices):
+def try_execute_pending_order(state, symbol, raw_data, prices):
     position = state["positions"][symbol]
-    pending = position["pending_order"]
+    pending = position.get("pending_order")
 
     if pending is None:
         return
@@ -388,69 +316,89 @@ def try_execute_pending_order(state, symbol, raw_data, latest_prices):
     if len(later_rows) == 0:
         return
 
-    execution_timestamp = later_rows.index[0]
-    execution_time = timestamp_text(execution_timestamp)
-    market_open = float(later_rows.iloc[0]["Open"])
+    row = later_rows.iloc[0]
+    execution_time = timestamp_text(later_rows.index[0])
 
     if pending["side"] == "BUY":
         execute_buy(
             state,
             symbol,
             execution_time,
-            market_open,
-            portfolio_value(state, latest_prices),
+            float(row["Open"]),
+            pending.get("atr"),
+            pending.get("reason", "unknown"),
+            prices,
         )
     elif pending["side"] == "SELL":
-        execute_sell(state, symbol, execution_time, market_open, "signal")
+        execute_sell(
+            state,
+            symbol,
+            execution_time,
+            float(row["Open"]),
+            pending.get("reason", "signal"),
+        )
 
     state["positions"][symbol]["pending_order"] = None
 
 
-def process_stop_loss(state, symbol, latest_price, timestamp):
+def process_stop_loss(state, symbol, raw_data):
     position = state["positions"][symbol]
+    stop_price = position.get("stop_price")
 
-    if position["shares"] <= 0 or position["stop_price"] is None:
+    if position["shares"] <= 0 or stop_price is None:
         return
 
-    if latest_price <= position["stop_price"]:
-        execute_sell(state, symbol, timestamp, latest_price, "stop_loss")
+    latest = raw_data.iloc[-1]
+    if float(latest["Low"]) <= float(stop_price):
+        fill_reference = min(float(latest["Open"]), float(stop_price))
+        execute_sell(
+            state,
+            symbol,
+            timestamp_text(raw_data.index[-1]),
+            fill_reference,
+            "atr_stop",
+        )
 
 
 def process_signal(state, symbol, completed):
     position = state["positions"][symbol]
     signal_time = timestamp_text(completed.index[-1])
 
-    if position["last_signal_bar"] == signal_time:
+    if position.get("last_signal_bar") == signal_time:
         return
 
     signal = strategy_signal(completed, position["shares"] > 0)
     position["last_signal_bar"] = signal_time
 
+    latest = completed.iloc[-1]
     log_event(
-        f"SIGNAL {symbol} {signal} bar={signal_time} "
-        f"close={completed.iloc[-1]['Close']:.4f}"
+        f"SIGNAL {symbol} side={signal.side} reason={signal.reason} "
+        f"bar={signal_time} close={float(latest['Close']):.4f}"
     )
 
-    if signal in {"BUY", "SELL"}:
+    if signal.side in {"BUY", "SELL"}:
         position["pending_order"] = {
-            "side": signal,
+            "side": signal.side,
+            "reason": signal.reason,
             "signal_time": signal_time,
+            "atr": float(latest["ATR14"]) if not pd.isna(latest["ATR14"]) else None,
         }
 
 
 # ==========================================
-# SECTION 12 — EQUITY HISTORY
+# HISTORY / OUTPUT
 # ==========================================
 
 
-def save_equity_snapshot(state, latest_prices):
+def save_equity_snapshot(state, prices):
     row = {
         "timestamp": datetime.now().isoformat(),
         "cash": state["cash"],
-        "portfolio_value": portfolio_value(state, latest_prices),
+        "portfolio_value": portfolio_value(state, prices),
         "realized_pnl": state["realized_pnl"],
-        "unrealized_pnl": unrealized_pnl(state, latest_prices),
+        "unrealized_pnl": unrealized_pnl(state, prices),
         "open_positions": open_position_count(state),
+        "market_status": state.get("market_status", "UNKNOWN"),
     }
 
     file_exists = EQUITY_CSV.exists()
@@ -461,96 +409,102 @@ def save_equity_snapshot(state, latest_prices):
         writer.writerow(row)
 
 
-# ==========================================
-# SECTION 13 — CLEAN TERMINAL OUTPUT
-# ==========================================
-
-
-def print_money_summary(state, latest_prices):
-    value = portfolio_value(state, latest_prices)
+def print_money_summary(state, prices):
+    value = portfolio_value(state, prices)
     total_pnl = value - STARTING_CASH
-    return_percent = total_pnl / STARTING_CASH * 100
-    unrealized = unrealized_pnl(state, latest_prices)
+    unrealized = unrealized_pnl(state, prices)
 
     print("\033[2J\033[H", end="")
-    print("PAPER PORTFOLIO — 5 MIN")
-    print("=" * 40)
+    print("5-MIN PAPER PORTFOLIO")
+    print("=" * 42)
+    print(f"Market:          {state.get('market_status', 'UNKNOWN')}")
     print(f"Account value:   ${value:,.2f}")
     print(f"Cash:            ${state['cash']:,.2f}")
     print(f"Total P/L:       ${total_pnl:+,.2f}")
-    print(f"Return:          {return_percent:+.2f}%")
+    print(f"Return:          {(total_pnl / STARTING_CASH * 100):+.2f}%")
     print(f"Realized P/L:    ${state['realized_pnl']:+,.2f}")
     print(f"Unrealized P/L:  ${unrealized:+,.2f}")
     print(f"Open positions:  {open_position_count(state)}/{MAX_OPEN_POSITIONS}")
     print(f"Completed trades:{len(state['trades']):>4}")
 
-    print()
-    print("POSITIONS")
-    print("-" * 40)
-
+    print("\nPOSITIONS")
+    print("-" * 42)
     any_position = False
+
     for symbol in SYMBOLS:
         position = state["positions"][symbol]
-        if position["shares"] <= 0 or symbol not in latest_prices:
+        if position["shares"] <= 0 or symbol not in prices:
             continue
 
         any_position = True
-        market_value = position["shares"] * latest_prices[symbol]
+        market_value = position["shares"] * prices[symbol]
         pnl = market_value - position["entry_total_cost"]
-        print(f"{symbol:<6} ${market_value:>9,.2f}  P/L ${pnl:+8,.2f}")
+        print(
+            f"{symbol:<6} ${market_value:>9,.2f}  "
+            f"P/L ${pnl:+8,.2f}  {position.get('entry_reason') or ''}"
+        )
 
     if not any_position:
         print("None")
 
-    print()
-    print("Dashboard: http://127.0.0.1:8050")
-    print("Price refresh: 60s | Signals: every completed 5m candle")
+    print("\nDashboard: http://127.0.0.1:8050")
     print("Ctrl+C to stop")
 
 
 # ==========================================
-# SECTION 14 — ONE LIVE CHECK
+# LIVE CHECK
 # ==========================================
 
 
-def run_once(state):
+def run_open_market_check(state):
     market_data = {}
-    latest_prices = {}
+    prices = {}
 
     for symbol in SYMBOLS:
-        raw = download_data(symbol)
-        completed = add_indicators(completed_bars(raw))
-
-        if len(completed) < 201:
+        raw = DEFAULT_PROVIDER.history(symbol, period=PERIOD)
+        if len(raw) < MIN_BARS:
             raise ValueError(f"Not enough 5-minute history for {symbol}.")
 
+        completed = add_indicators(raw.iloc[:-1].copy())
         market_data[symbol] = (raw, completed)
-        latest_prices[symbol] = float(raw.iloc[-1]["Close"])
+        prices[symbol] = float(raw.iloc[-1]["Close"])
 
+    state["last_prices"] = prices
+
+    # Old queued signals fill first on the first later bar.
     for symbol in SYMBOLS:
         raw, _ = market_data[symbol]
-        try_execute_pending_order(state, symbol, raw, latest_prices)
+        try_execute_pending_order(state, symbol, raw, prices)
 
+    # Then stops are enforced from the newest available bar.
     for symbol in SYMBOLS:
         raw, _ = market_data[symbol]
-        process_stop_loss(
-            state,
-            symbol,
-            latest_prices[symbol],
-            timestamp_text(raw.index[-1]),
-        )
+        process_stop_loss(state, symbol, raw)
 
+    # Finally, completed bars create next-bar orders.
     for symbol in SYMBOLS:
         _, completed = market_data[symbol]
         process_signal(state, symbol, completed)
 
+    save_equity_snapshot(state, prices)
+    return prices
+
+
+def run_once(state):
+    status = market_session_status()
+    state["market_status"] = status
+
+    if status == "OPEN":
+        prices = run_open_market_check(state)
+    else:
+        prices = state.get("last_prices", {})
+
     save_state(state)
-    save_equity_snapshot(state, latest_prices)
-    print_money_summary(state, latest_prices)
+    print_money_summary(state, prices)
 
 
 # ==========================================
-# SECTION 15 — CONTINUOUS BOT LOOP
+# MAIN LOOP
 # ==========================================
 
 
@@ -567,6 +521,8 @@ def main():
                 run_once(state)
             except Exception as error:
                 logging.exception("Live check failed")
+                state["market_status"] = "ERROR"
+                save_state(state)
                 print(f"\nCheck failed: {error}")
 
             time.sleep(POLL_SECONDS)
@@ -578,8 +534,7 @@ def main():
         if dashboard_process is not None and dashboard_process.poll() is None:
             dashboard_process.terminate()
 
-        print()
-        print("Paper trader stopped.")
+        print("\nPaper trader stopped.")
         print(f"State saved to {STATE_FILE}")
 
 
