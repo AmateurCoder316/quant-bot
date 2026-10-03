@@ -24,8 +24,16 @@ def split_for_year(year):
     return "test"
 
 
+def regular_session_only(data):
+    """Keep 09:30-15:55 America/New_York bars before feature calculation."""
+    local_index = data.index.tz_convert(MARKET_TIMEZONE)
+    local_minutes = local_index.hour * 60 + local_index.minute
+    mask = (local_minutes >= 9 * 60 + 30) & (local_minutes < 16 * 60)
+    return data.loc[mask].copy()
+
+
 def build_symbol_dataset(symbol):
-    data = LOCAL_PROVIDER.history(symbol)
+    data = regular_session_only(LOCAL_PROVIDER.history(symbol))
     frame = build_feature_frame(data)
 
     local_index = frame.index.tz_convert(MARKET_TIMEZONE)
@@ -33,12 +41,6 @@ def build_symbol_dataset(symbol):
     frame["symbol"] = symbol
     frame["year"] = local_index.year
     frame["split"] = [split_for_year(year) for year in frame["year"]]
-
-    # Keep regular US-session bars only. This also protects us if a future
-    # provider includes pre-market or after-hours data.
-    local_minutes = local_index.hour * 60 + local_index.minute
-    regular_session = (local_minutes >= 9 * 60 + 30) & (local_minutes < 16 * 60)
-    frame = frame.loc[regular_session].copy()
 
     keep = [
         "timestamp",
@@ -116,7 +118,7 @@ def main():
         "split_rows": {key: int(value) for key, value in split_counts.items()},
         "symbol_rows": {key: int(value) for key, value in symbol_counts.items()},
         "target_policy": "Future targets stay within the same America/New_York trading date.",
-        "feature_policy": "Feature columns use current/past bars only; target columns are not model inputs.",
+        "feature_policy": "Feature columns use current/past regular-session bars only; target columns are not model inputs.",
     }
 
     METADATA_PATH.write_text(json.dumps(metadata, indent=2) + "\n")
