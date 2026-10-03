@@ -14,12 +14,11 @@ from exp2_config import (
 )
 from exp2_core import (
     all_execution_rules,
-    evaluate_rule,
     load_event_dataset,
     predict_stack,
-    select_execution_rule,
     stack_metrics,
 )
+from exp2_execution import evaluate_rule, select_execution_rule
 
 
 def json_clean(value):
@@ -48,6 +47,7 @@ def main():
     print("Only one execution axis is searched: causal rolling percentile of meta-score.")
     print(f"Minimum completed trades for deployment support: {MIN_TRADES_FOR_DEPLOYMENT}")
     print("Boundary percentiles are diagnostic only; deployment requires both neighbors.")
+    print("Deployment also requires >55% positive months and positive median month.")
 
     bundle = joblib.load(MODEL_PATH)
     events = load_event_dataset()
@@ -83,7 +83,8 @@ def main():
             f"{rule.label:<18} | candidates={result['candidate_events']:4d} "
             f"cost={cost['return']:+7.2f}% PF={cost['profit_factor']:.2f} "
             f"trades={cost['trades']:4d} avg={cost['avg_trade']:+.3f}% "
-            f"DD={cost['max_drawdown']:+.2f}% Sharpe={cost['sharpe']:+.2f} | "
+            f"DD={cost['max_drawdown']:+.2f}% Sharpe={cost['sharpe']:+.2f} "
+            f"posmo={cost['positive_month_fraction']*100:4.0f}% | "
             f"gross={gross['return']:+7.2f}% PF={gross['profit_factor']:.2f}"
         )
 
@@ -100,6 +101,13 @@ def main():
     print(f"2025 trades:              {selected['cost']['trades']}")
     print(f"2025 max drawdown:        {selected['cost']['max_drawdown']:+.2f}%")
     print(f"2025 daily Sharpe:        {selected['cost']['sharpe']:+.2f}")
+    print(
+        f"Positive months:          {selected['cost']['positive_months']}/"
+        f"{selected['cost']['months']} "
+        f"({selected['cost']['positive_month_fraction']*100:.1f}%)"
+    )
+    print(f"Median month:             {selected['cost']['median_month']:+.2f}%")
+    print(f"Worst month:              {selected['cost']['worst_month']:+.2f}%")
     print(f"Gross profit factor:      {selected['gross']['profit_factor']:.2f}")
     print(f"Local median return:      {selected['stability_median_return']:+.2f}%")
     print(f"Local WORST return:       {selected['stability_worst_return']:+.2f}%")
@@ -118,7 +126,8 @@ def main():
         "selection_policy": (
             "Choose among five predeclared causal meta-score percentiles. A deployable interior "
             "rule requires >=75 completed trades, positive after-cost return/average trade/Sharpe, "
-            "PF>=1.15, gross PF>=1.25, and a fully positive local three-threshold plateau."
+            "PF>=1.15, gross PF>=1.25, >55% positive calendar months, positive median month, and "
+            "a fully positive local three-threshold plateau."
         ),
         "selected": selected,
         "all_results": scored,
