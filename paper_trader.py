@@ -1,6 +1,8 @@
 import csv
 import json
 import logging
+import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -19,8 +21,8 @@ PERIOD = "60d"
 POLL_SECONDS = 60
 
 STARTING_CASH = 10000.0
-COMMISSION_RATE = 0.001      # 0.10%
-SLIPPAGE_RATE = 0.0005       # 0.05%
+COMMISSION_RATE = 0.001
+SLIPPAGE_RATE = 0.0005
 
 # Risk controls
 POSITION_SIZE_PERCENT = 0.20
@@ -32,6 +34,7 @@ LOG_DIR = Path("logs")
 LOG_FILE = LOG_DIR / "paper_trader.log"
 TRADE_CSV = LOG_DIR / "trades.csv"
 EQUITY_CSV = LOG_DIR / "equity.csv"
+DASHBOARD_FILE = Path("dashboard.py")
 
 
 # ==========================================
@@ -53,7 +56,30 @@ def log_event(message):
 
 
 # ==========================================
-# SECTION 3 — MARKET DATA
+# SECTION 3 — DASHBOARD PROCESS
+# ==========================================
+
+
+def launch_dashboard():
+    if not DASHBOARD_FILE.exists():
+        log_event("Dashboard not started: dashboard.py not found")
+        return None
+
+    try:
+        process = subprocess.Popen(
+            [sys.executable, str(DASHBOARD_FILE)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log_event("Dashboard process started")
+        return process
+    except Exception:
+        logging.exception("Failed to launch dashboard")
+        return None
+
+
+# ==========================================
+# SECTION 4 — MARKET DATA
 # ==========================================
 
 
@@ -79,12 +105,11 @@ def download_data(symbol):
 
 
 def completed_bars(data):
-    # The newest Yahoo candle may still be forming.
     return data.iloc[:-1].copy()
 
 
 # ==========================================
-# SECTION 4 — INDICATORS
+# SECTION 5 — INDICATORS
 # ==========================================
 
 
@@ -111,7 +136,7 @@ def add_indicators(data):
 
 
 # ==========================================
-# SECTION 5 — STRATEGY
+# SECTION 6 — STRATEGY
 # ==========================================
 
 
@@ -147,7 +172,7 @@ def strategy_signal(data, has_position):
 
 
 # ==========================================
-# SECTION 6 — PERSISTENT STATE
+# SECTION 7 — PERSISTENT STATE
 # ==========================================
 
 
@@ -199,7 +224,7 @@ def save_state(state):
 
 
 # ==========================================
-# SECTION 7 — PORTFOLIO HELPERS
+# SECTION 8 — PORTFOLIO HELPERS
 # ==========================================
 
 
@@ -235,7 +260,7 @@ def unrealized_pnl(state, latest_prices):
 
 
 # ==========================================
-# SECTION 8 — TRADE RECORDING
+# SECTION 9 — TRADE RECORDING
 # ==========================================
 
 
@@ -264,7 +289,7 @@ def record_trade(state, symbol, execution_time, execution_price, pnl, return_per
 
 
 # ==========================================
-# SECTION 9 — ORDER EXECUTION
+# SECTION 10 — ORDER EXECUTION
 # ==========================================
 
 
@@ -342,7 +367,7 @@ def execute_sell(state, symbol, execution_time, market_price, reason):
 
 
 # ==========================================
-# SECTION 10 — SIGNAL / ORDER PROCESSING
+# SECTION 11 — SIGNAL / ORDER PROCESSING
 # ==========================================
 
 
@@ -414,7 +439,7 @@ def process_signal(state, symbol, completed):
 
 
 # ==========================================
-# SECTION 11 — EQUITY HISTORY
+# SECTION 12 — EQUITY HISTORY
 # ==========================================
 
 
@@ -437,7 +462,7 @@ def save_equity_snapshot(state, latest_prices):
 
 
 # ==========================================
-# SECTION 12 — CLEAN TERMINAL OUTPUT
+# SECTION 13 — CLEAN TERMINAL OUTPUT
 # ==========================================
 
 
@@ -478,12 +503,13 @@ def print_money_summary(state, latest_prices):
         print("None")
 
     print()
+    print("Dashboard: http://127.0.0.1:8050")
     print("Price refresh: 60s | Signals: every completed 5m candle")
     print("Ctrl+C to stop")
 
 
 # ==========================================
-# SECTION 13 — ONE LIVE CHECK
+# SECTION 14 — ONE LIVE CHECK
 # ==========================================
 
 
@@ -524,13 +550,15 @@ def run_once(state):
 
 
 # ==========================================
-# SECTION 14 — CONTINUOUS BOT LOOP
+# SECTION 15 — CONTINUOUS BOT LOOP
 # ==========================================
 
 
 def main():
     setup_logging()
     state = load_state()
+    dashboard_process = launch_dashboard()
+
     log_event("5-minute paper trader started")
 
     try:
@@ -546,6 +574,10 @@ def main():
     except KeyboardInterrupt:
         save_state(state)
         log_event("5-minute paper trader stopped")
+
+        if dashboard_process is not None and dashboard_process.poll() is None:
+            dashboard_process.terminate()
+
         print()
         print("Paper trader stopped.")
         print(f"State saved to {STATE_FILE}")
