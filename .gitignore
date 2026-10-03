@@ -5,3 +5,4 @@ __pycache__/
 ssh
 ssh.pub
 paper_state.json
+paper_state_15m.json
