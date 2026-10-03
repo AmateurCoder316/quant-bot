@@ -21,25 +21,64 @@ symbols = [
 
 period = "5y"
 starting_cash = 10000.0
-
 commission_rate = 0.001      # 0.10%
 slippage_rate = 0.0005       # 0.05%
-
-# First 70% of the history is used for research.
-# The final 30% is kept unseen until the final test.
 train_ratio = 0.70
 
-candidate_ma_pairs = [
-    (5, 20),
-    (10, 50),
-    (20, 100),
-    (50, 200),
+# We are no longer testing only MA crossovers.
+# Each item below is a separate candidate strategy.
+strategy_candidates = [
+    {
+        "name": "Trend MA50/200",
+        "family": "trend",
+        "fast": 50,
+        "slow": 200,
+    },
+    {
+        "name": "Trend MA20/100",
+        "family": "trend",
+        "fast": 20,
+        "slow": 100,
+    },
+    {
+        "name": "Momentum 60/0",
+        "family": "momentum",
+        "lookback": 60,
+        "threshold": 0.0,
+    },
+    {
+        "name": "Momentum 120/0",
+        "family": "momentum",
+        "lookback": 120,
+        "threshold": 0.0,
+    },
+    {
+        "name": "Breakout 55/20",
+        "family": "breakout",
+        "entry_window": 55,
+        "exit_window": 20,
+    },
+    {
+        "name": "Breakout 20/10",
+        "family": "breakout",
+        "entry_window": 20,
+        "exit_window": 10,
+    },
+    {
+        "name": "Mean Reversion RSI2",
+        "family": "mean_reversion",
+        "rsi_period": 2,
+        "buy_rsi": 10,
+        "sell_rsi": 70,
+        "trend_ma": 200,
+    },
 ]
 
 
 # ==========================================
-# SECTION 2 — DOWNLOAD DATA
+# SECTION 2 — DOWNLOAD MARKET DATA
 # ==========================================
+
 
 def download_data(symbol):
     data = yf.download(
@@ -50,9 +89,6 @@ def download_data(symbol):
         progress=False,
     )
 
-    # yfinance normally gives columns such as:
-    # ("Close", "AAPL")
-    # We only need the first level: Close, Open, etc.
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
 
@@ -77,86 +113,209 @@ training_data = {}
 
 for symbol, data in market_data.items():
     split_position = int(len(data) * train_ratio)
-
     split_positions[symbol] = split_position
     training_data[symbol] = data.iloc[:split_position].copy()
 
 
 # ==========================================
-# SECTION 4 — BACKTEST FUNCTION
+# SECTION 4 — INDICATOR HELPERS
 # ==========================================
+
+
+def calculate_rsi(close, period):
+    """Calculate RSI from a closing-price Series."""
+
+    price_change = close.diff()
+
+    gains = price_change.clip(lower=0)
+    losses = -price_change.clip(upper=0)
+
+    average_gain = gains.rolling(period).mean()
+    average_loss = losses.rolling(period).mean()
+
+    relative_strength = average_gain / average_loss
+
+    return 100 - (100 / (1 + relative_strength))
+
+
+# ==========================================
+# SECTION 5 — STRATEGY SIGNAL GENERATOR
+# ==========================================
+
+
+def generate_signals(data, strategy):
+    """
+    Add a Signal column for one strategy candidate.
+
+    Signals are created using today's completed daily data.
+    The backtester executes them at the NEXT trading day's open.
+    """
+
+    data = data.copy()
+    data["Signal"] = "HOLD"
+
+    family = strategy["family"]
+
+    # --------------------------------------
+    # TREND FOLLOWING
+    # --------------------------------------
+
+    if family == "trend":
+        fast = strategy["fast"]
+        slow = strategy["slow"]
+
+        data["FastMA"] = data["Close"].rolling(fast).mean()
+        data["SlowMA"] = data["Close"].rolling(slow).mean()
+
+        previous_fast = data["FastMA"].shift(1)
+        previous_slow = data["SlowMA"].shift(1)
+
+        buy = (
+            (previous_fast <= previous_slow)
+            & (data["FastMA"] > data["SlowMA"])
+        )
+
+        sell = (
+            (previous_fast >= previous_slow)
+            & (data["FastMA"] < data["SlowMA"])
+        )
+
+        data.loc[buy, "Signal"] = "BUY"
+        data.loc[sell, "Signal"] = "SELL"
+        data.loc[data["SlowMA"].isna(), "Signal"] = "WAIT"
+
+    # --------------------------------------
+    # MOMENTUM
+    # --------------------------------------
+
+    elif family == "momentum":
+        lookback = strategy["lookback"]
+        threshold = strategy["threshold"]
+
+        data["Momentum"] = data["Close"].pct_change(lookback)
+
+        previous_momentum = data["Momentum"].shift(1)
+
+        buy = (
+            (previous_momentum <= threshold)
+            & (data["Momentum"] > threshold)
+        )
+
+        sell = (
+            (previous_momentum >= threshold)
+            & (data["Momentum"] < threshold)
+        )
+
+        data.loc[buy, "Signal"] = "BUY"
+        data.loc[sell, "Signal"] = "SELL"
+        data.loc[data["Momentum"].isna(), "Signal"] = "WAIT"
+
+    # --------------------------------------
+    # BREAKOUT
+    # --------------------------------------
+
+    elif family == "breakout":
+        entry_window = strategy["entry_window"]
+        exit_window = strategy["exit_window"]
+
+        # shift(1) is critical: today's close is compared only
+        # with levels that were already known before today closed.
+        data["EntryHigh"] = (
+            data["High"]
+            .rolling(entry_window)
+            .max()
+            .shift(1)
+        )
+
+        data["ExitLow"] = (
+            data["Low"]
+            .rolling(exit_window)
+            .min()
+            .shift(1)
+        )
+
+        data.loc[
+            data["Close"] > data["EntryHigh"],
+            "Signal",
+        ] = "BUY"
+
+        data.loc[
+            data["Close"] < data["ExitLow"],
+            "Signal",
+        ] = "SELL"
+
+        data.loc[
+            data["EntryHigh"].isna() | data["ExitLow"].isna(),
+            "Signal",
+        ] = "WAIT"
+
+    # --------------------------------------
+    # MEAN REVERSION
+    # --------------------------------------
+
+    elif family == "mean_reversion":
+        rsi_period = strategy["rsi_period"]
+        buy_rsi = strategy["buy_rsi"]
+        sell_rsi = strategy["sell_rsi"]
+        trend_ma = strategy["trend_ma"]
+
+        data["RSI"] = calculate_rsi(data["Close"], rsi_period)
+        data["TrendMA"] = data["Close"].rolling(trend_ma).mean()
+
+        # Only buy short-term weakness while the long-term
+        # price trend is still above its trend average.
+        data.loc[
+            (data["RSI"] < buy_rsi)
+            & (data["Close"] > data["TrendMA"]),
+            "Signal",
+        ] = "BUY"
+
+        data.loc[
+            data["RSI"] > sell_rsi,
+            "Signal",
+        ] = "SELL"
+
+        data.loc[
+            data["TrendMA"].isna() | data["RSI"].isna(),
+            "Signal",
+        ] = "WAIT"
+
+    else:
+        raise ValueError(f"Unknown strategy family: {family}")
+
+    return data
+
+
+# ==========================================
+# SECTION 6 — GENERIC BACKTESTER
+# ==========================================
+
 
 def backtest(
     data,
-    fast_ma,
-    slow_ma,
+    strategy,
     starting_cash=10000.0,
     trade_start=None,
     force_close_at_end=True,
 ):
     """
-    Backtest one moving-average crossover strategy.
+    Backtest any strategy produced by generate_signals().
 
-    data:
-        Historical OHLCV data. It may include warm-up history before
-        trade_start so indicators are already valid when testing begins.
-
-    trade_start:
-        Earliest date on which an order may execute. Data before this date
-        is indicator warm-up only and cannot create a trade.
-
-    force_close_at_end:
-        If True, any remaining position is sold at the final close with
-        slippage and commission. This makes every test fully realized.
+    trade_start lets us include old rows only for indicator warm-up.
+    No order may execute before trade_start.
     """
 
-    data = data.copy()
+    data = generate_signals(data, strategy)
 
-    if len(data) <= slow_ma:
-        raise ValueError(
-            f"Not enough data for MA{slow_ma}: only {len(data)} rows."
-        )
-
-    # --------------------------------------
-    # INDICATORS
-    # --------------------------------------
-
-    data["FastMA"] = data["Close"].rolling(window=fast_ma).mean()
-    data["SlowMA"] = data["Close"].rolling(window=slow_ma).mean()
-
-    # --------------------------------------
-    # SIGNALS
-    # --------------------------------------
-
-    data["Signal"] = "HOLD"
-
-    previous_fast = data["FastMA"].shift(1)
-    previous_slow = data["SlowMA"].shift(1)
-
-    buy_condition = (
-        (previous_fast <= previous_slow)
-        & (data["FastMA"] > data["SlowMA"])
-    )
-
-    sell_condition = (
-        (previous_fast >= previous_slow)
-        & (data["FastMA"] < data["SlowMA"])
-    )
-
-    data.loc[buy_condition, "Signal"] = "BUY"
-    data.loc[sell_condition, "Signal"] = "SELL"
-    data.loc[data["SlowMA"].isna(), "Signal"] = "WAIT"
-
-    # If no explicit start is supplied, the backtest may trade throughout
-    # the supplied dataset.
     if trade_start is None:
         trade_start = data.index[0]
 
     trade_start = pd.Timestamp(trade_start)
 
-    # --------------------------------------
-    # ACCOUNT STATE
-    # --------------------------------------
+    trading_dates = data.index[data.index >= trade_start]
+
+    if len(trading_dates) == 0:
+        raise ValueError("trade_start is after all available data")
 
     cash = starting_cash
     shares = 0.0
@@ -166,19 +325,11 @@ def backtest(
     entry_total_cost = None
 
     trade_history = []
-    portfolio_history = []
-
     exposure_days = 0
     forced_exit = False
 
-    # Keep only the equity curve from the actual trading period.
-    trading_dates = data.index[data.index >= trade_start]
-
-    if len(trading_dates) == 0:
-        raise ValueError("trade_start is after all available data.")
-
     first_trading_date = trading_dates[0]
-    portfolio_history.append((first_trading_date, starting_cash))
+    portfolio_history = [(first_trading_date, starting_cash)]
 
     # --------------------------------------
     # TRADING LOOP
@@ -187,25 +338,18 @@ def backtest(
     for i in range(len(data) - 1):
         today = data.iloc[i]
         tomorrow = data.iloc[i + 1]
-
         execution_date = data.index[i + 1]
 
-        # Rows before the unseen-test boundary may calculate indicators,
-        # but they are NOT allowed to execute orders.
         if execution_date < trade_start:
             continue
 
         signal = today["Signal"]
         tomorrow_open = tomorrow["Open"]
 
-        # ==================================
-        # BUY
-        # ==================================
-
+        # BUY at next day's open
         if signal == "BUY" and shares == 0:
             execution_price = tomorrow_open * (1 + slippage_rate)
 
-            # Reserve enough cash to pay commission as well as the shares.
             trade_value = cash / (1 + commission_rate)
             buy_commission = trade_value * commission_rate
 
@@ -217,10 +361,7 @@ def backtest(
             entry_date = execution_date
             entry_price = execution_price
 
-        # ==================================
-        # SELL
-        # ==================================
-
+        # SELL at next day's open
         elif signal == "SELL" and shares > 0:
             execution_price = tomorrow_open * (1 - slippage_rate)
 
@@ -248,86 +389,82 @@ def backtest(
             entry_price = None
             entry_total_cost = None
 
-        # ==================================
-        # END-OF-DAY EQUITY
-        # ==================================
-
         daily_value = cash + shares * tomorrow["Close"]
         portfolio_history.append((execution_date, daily_value))
 
         if shares > 0:
             exposure_days += 1
 
-    # ======================================
-    # FORCE-CLOSE OPEN POSITION AT THE END
-    # ======================================
+    # --------------------------------------
+    # FORCE-CLOSE OPEN POSITION
+    # --------------------------------------
 
-    latest_date = data.index[-1]
-    latest_close = data["Close"].iloc[-1]
+    unrealized_profit = 0.0
 
-    if shares > 0 and force_close_at_end:
-        forced_exit = True
+    if shares > 0:
+        latest_close = data["Close"].iloc[-1]
 
-        execution_price = latest_close * (1 - slippage_rate)
-        gross_sale_value = shares * execution_price
+        liquidation_price = latest_close * (1 - slippage_rate)
+        gross_sale_value = shares * liquidation_price
         sell_commission = gross_sale_value * commission_rate
         net_sale_value = gross_sale_value - sell_commission
 
-        trade_profit = net_sale_value - entry_total_cost
-        trade_return = (trade_profit / entry_total_cost) * 100
+        unrealized_profit = net_sale_value - entry_total_cost
 
-        cash += net_sale_value
+        if force_close_at_end:
+            cash += net_sale_value
 
-        trade_history.append({
-            "Entry Date": entry_date,
-            "Exit Date": latest_date,
-            "Entry Price": entry_price,
-            "Exit Price": execution_price,
-            "P/L": trade_profit,
-            "Return %": trade_return,
-            "Exit Reason": "END",
-        })
+            trade_history.append({
+                "Entry Date": entry_date,
+                "Exit Date": data.index[-1],
+                "Entry Price": entry_price,
+                "Exit Price": liquidation_price,
+                "P/L": unrealized_profit,
+                "Return %": (unrealized_profit / entry_total_cost) * 100,
+                "Exit Reason": "END",
+            })
 
-        shares = 0.0
-        entry_date = None
-        entry_price = None
-        entry_total_cost = None
+            shares = 0.0
+            entry_date = None
+            entry_price = None
+            entry_total_cost = None
+            unrealized_profit = 0.0
+            forced_exit = True
 
-        # Replace the final marked-to-market equity value with the true
-        # liquidation value after slippage and commission.
-        if portfolio_history and portfolio_history[-1][0] == latest_date:
-            portfolio_history[-1] = (latest_date, cash)
-        else:
-            portfolio_history.append((latest_date, cash))
+    # --------------------------------------
+    # FINAL VALUE
+    # --------------------------------------
 
-    open_position = shares > 0
-
-    if open_position:
-        # This branch is only used if force_close_at_end=False.
-        final_marked_value = cash + shares * latest_close
-        unrealized_profit = final_marked_value - entry_total_cost
-        final_portfolio_value = final_marked_value
+    if shares > 0:
+        latest_close = data["Close"].iloc[-1]
+        estimated_exit = latest_close * (1 - slippage_rate)
+        gross_value = shares * estimated_exit
+        final_value = cash + gross_value * (1 - commission_rate)
     else:
-        unrealized_profit = 0.0
-        final_portfolio_value = cash
+        final_value = cash
 
-    total_profit = final_portfolio_value - starting_cash
+    portfolio_history[-1] = (
+        portfolio_history[-1][0],
+        final_value,
+    )
+
+    total_profit = final_value - starting_cash
     total_return = (total_profit / starting_cash) * 100
 
-    # ======================================
+    # --------------------------------------
     # TRADE STATISTICS
-    # ======================================
+    # --------------------------------------
 
     trades = pd.DataFrame(trade_history)
-    number_of_trades = len(trades)
+    trade_count = len(trades)
 
-    if number_of_trades > 0:
+    if trade_count > 0:
         winners = trades[trades["P/L"] > 0]
         losers = trades[trades["P/L"] < 0]
 
-        win_count = len(winners)
-        loss_count = len(losers)
-        win_rate = (win_count / number_of_trades) * 100
+        wins = len(winners)
+        losses = len(losers)
+        win_rate = (wins / trade_count) * 100
 
         gross_profit = winners["P/L"].sum()
         gross_loss = abs(losers["P/L"].sum())
@@ -341,216 +478,216 @@ def backtest(
 
         expectancy = trades["P/L"].mean()
     else:
-        win_count = 0
-        loss_count = 0
+        wins = 0
+        losses = 0
         win_rate = 0.0
-        gross_profit = 0.0
-        gross_loss = 0.0
         profit_factor = 0.0
         expectancy = 0.0
 
-    # ======================================
+    # --------------------------------------
     # EQUITY CURVE + RISK METRICS
-    # ======================================
+    # --------------------------------------
 
     portfolio_df = pd.DataFrame(
         portfolio_history,
         columns=["Date", "Strategy"],
-    )
+    ).set_index("Date")
 
-    # A date can appear twice if trade_start equals a later execution date.
-    # Keep the final value for each date.
-    portfolio_df = (
-        portfolio_df
-        .drop_duplicates(subset="Date", keep="last")
-        .set_index("Date")
-        .sort_index()
-    )
-
-    portfolio_df["Daily Return"] = portfolio_df["Strategy"].pct_change()
-    daily_returns = portfolio_df["Daily Return"].dropna()
-
+    daily_returns = portfolio_df["Strategy"].pct_change().dropna()
     daily_std = daily_returns.std()
 
-    if pd.notna(daily_std) and daily_std > 0:
-        sharpe_ratio = (
-            daily_returns.mean() / daily_std
+    if daily_std > 0:
+        sharpe = (
+            daily_returns.mean()
+            / daily_std
         ) * (252 ** 0.5)
     else:
-        sharpe_ratio = 0.0
+        sharpe = 0.0
 
     peaks = portfolio_df["Strategy"].cummax()
     drawdowns = portfolio_df["Strategy"] / peaks - 1
     max_drawdown = drawdowns.min() * 100
 
-    possible_exposure_days = max(len(portfolio_df) - 1, 1)
-    exposure_percent = (exposure_days / possible_exposure_days) * 100
+    possible_exposure_days = max(len(trading_dates) - 1, 1)
+    exposure = (exposure_days / possible_exposure_days) * 100
 
-    total_days = (portfolio_df.index[-1] - portfolio_df.index[0]).days
+    total_days = (trading_dates[-1] - trading_dates[0]).days
     years = total_days / 365.25
 
-    if years > 0 and final_portfolio_value > 0:
+    if years > 0 and final_value > 0:
         cagr = (
-            (final_portfolio_value / starting_cash) ** (1 / years)
+            (final_value / starting_cash) ** (1 / years)
             - 1
         ) * 100
     else:
         cagr = 0.0
 
-    # ======================================
+    # --------------------------------------
     # BUY-AND-HOLD BENCHMARK
-    # ======================================
+    # --------------------------------------
 
-    # The benchmark begins at the unseen-test boundary too.
-    benchmark_rows = data[data.index >= trade_start].copy()
+    start_position = data.index.get_loc(first_trading_date)
 
-    benchmark_start_date = benchmark_rows.index[0]
-    benchmark_start_open = benchmark_rows["Open"].iloc[0]
+    benchmark_cash = starting_cash
+    benchmark_shares = 0.0
+    benchmark_history = []
 
-    benchmark_buy_price = benchmark_start_open * (1 + slippage_rate)
-    benchmark_trade_value = starting_cash / (1 + commission_rate)
-    benchmark_buy_commission = benchmark_trade_value * commission_rate
-    benchmark_shares = benchmark_trade_value / benchmark_buy_price
-    benchmark_cash = (
-        starting_cash
-        - benchmark_trade_value
-        - benchmark_buy_commission
+    for i in range(start_position, len(data)):
+        date = data.index[i]
+
+        if benchmark_shares == 0:
+            benchmark_buy_price = (
+                data["Open"].iloc[i]
+                * (1 + slippage_rate)
+            )
+
+            benchmark_trade_value = (
+                benchmark_cash
+                / (1 + commission_rate)
+            )
+
+            benchmark_buy_commission = (
+                benchmark_trade_value
+                * commission_rate
+            )
+
+            benchmark_shares = (
+                benchmark_trade_value
+                / benchmark_buy_price
+            )
+
+            benchmark_cash -= (
+                benchmark_trade_value
+                + benchmark_buy_commission
+            )
+
+        benchmark_value = (
+            benchmark_cash
+            + benchmark_shares * data["Close"].iloc[i]
+        )
+
+        benchmark_history.append((date, benchmark_value))
+
+    benchmark_final_price = (
+        data["Close"].iloc[-1]
+        * (1 - slippage_rate)
     )
 
-    benchmark_values = []
-
-    for date, row in benchmark_rows.iterrows():
-        benchmark_value = benchmark_cash + benchmark_shares * row["Close"]
-        benchmark_values.append((date, benchmark_value))
-
-    benchmark_final_price = latest_close * (1 - slippage_rate)
     benchmark_gross = benchmark_shares * benchmark_final_price
     benchmark_sell_commission = benchmark_gross * commission_rate
+
     benchmark_final_value = (
         benchmark_cash
         + benchmark_gross
         - benchmark_sell_commission
     )
 
-    benchmark_df = pd.DataFrame(
-        benchmark_values,
-        columns=["Date", "Benchmark"],
-    ).set_index("Date")
-
-    benchmark_df.iloc[-1, benchmark_df.columns.get_loc("Benchmark")] = (
-        benchmark_final_value
+    benchmark_history[-1] = (
+        benchmark_history[-1][0],
+        benchmark_final_value,
     )
 
     benchmark_return = (
-        benchmark_final_value / starting_cash - 1
+        benchmark_final_value / starting_cash
+        - 1
     ) * 100
 
-    equity_curve = portfolio_df[["Strategy"]].join(
-        benchmark_df[["Benchmark"]],
-        how="outer",
-    ).sort_index()
+    benchmark_df = pd.DataFrame(
+        benchmark_history,
+        columns=["Date", "Benchmark"],
+    ).set_index("Date")
 
-    # ======================================
+    equity_curve = portfolio_df.join(benchmark_df, how="left")
+
+    # --------------------------------------
     # ACCOUNTING CHECK
-    # ======================================
+    # --------------------------------------
 
     closed_trade_profit = (
         trades["P/L"].sum()
-        if number_of_trades > 0
+        if trade_count > 0
         else 0.0
     )
 
-    accounted_profit = closed_trade_profit + unrealized_profit
-    accounting_error = total_profit - accounted_profit
-
-    # ======================================
-    # RETURN RESULTS
-    # ======================================
+    accounting_error = (
+        total_profit
+        - closed_trade_profit
+        - unrealized_profit
+    )
 
     return {
-        "fast_ma": fast_ma,
-        "slow_ma": slow_ma,
-        "final_value": final_portfolio_value,
+        "strategy": strategy["name"],
+        "family": strategy["family"],
+        "final_value": final_value,
         "profit": total_profit,
         "return": total_return,
-        "benchmark_value": benchmark_final_value,
         "benchmark_return": benchmark_return,
-        "trades": trades,
-        "trade_count": number_of_trades,
-        "wins": win_count,
-        "losses": loss_count,
+        "trade_count": trade_count,
+        "wins": wins,
+        "losses": losses,
         "win_rate": win_rate,
         "profit_factor": profit_factor,
         "expectancy": expectancy,
-        "sharpe": sharpe_ratio,
+        "sharpe": sharpe,
         "max_drawdown": max_drawdown,
-        "exposure": exposure_percent,
+        "exposure": exposure,
         "cagr": cagr,
-        "open_position": open_position,
         "forced_exit": forced_exit,
+        "open_position": shares > 0,
         "unrealized_profit": unrealized_profit,
-        "closed_trade_profit": closed_trade_profit,
         "accounting_error": accounting_error,
+        "trades": trades,
         "equity_curve": equity_curve,
-        "data": data,
     }
 
 
 # ==========================================
-# SECTION 5 — PARAMETER RESEARCH
+# SECTION 7 — TRAINING RESEARCH
 # ==========================================
 
-parameter_results = []
+training_rows = []
 
-for fast_ma, slow_ma in candidate_ma_pairs:
-    symbol_results = []
+for strategy in strategy_candidates:
+    results = []
 
     for symbol in symbols:
         result = backtest(
             training_data[symbol],
-            fast_ma,
-            slow_ma,
+            strategy,
             starting_cash,
         )
 
-        symbol_results.append(result)
+        results.append(result)
 
-    average_return = sum(
-        result["return"]
-        for result in symbol_results
-    ) / len(symbol_results)
-
-    average_sharpe = sum(
-        result["sharpe"]
-        for result in symbol_results
-    ) / len(symbol_results)
-
-    average_drawdown = sum(
-        result["max_drawdown"]
-        for result in symbol_results
-    ) / len(symbol_results)
-
-    parameter_results.append({
-        "Fast MA": fast_ma,
-        "Slow MA": slow_ma,
-        "Average Train Return": average_return,
-        "Average Train Sharpe": average_sharpe,
-        "Average Train Drawdown": average_drawdown,
+    training_rows.append({
+        "Strategy": strategy["name"],
+        "Family": strategy["family"],
+        "Average Train Return": sum(
+            result["return"] for result in results
+        ) / len(results),
+        "Average Train Sharpe": sum(
+            result["sharpe"] for result in results
+        ) / len(results),
+        "Average Train Drawdown": sum(
+            result["max_drawdown"] for result in results
+        ) / len(results),
+        "Average Train Trades": sum(
+            result["trade_count"] for result in results
+        ) / len(results),
     })
 
 
-parameter_table = pd.DataFrame(parameter_results)
+training_table = pd.DataFrame(training_rows)
 
 
 # ==========================================
-# SECTION 6 — SELECT TRAINING WINNER
+# SECTION 8 — SELECT ONE CANDIDATE
 # ==========================================
 
-# IMPORTANT:
-# We select the strategy using TRAINING DATA ONLY.
-# The unseen test data does not influence this choice.
-best_row = (
-    parameter_table
+# Selection uses training data ONLY.
+# The unseen test set has no influence on this choice.
+selected_row = (
+    training_table
     .sort_values(
         "Average Train Sharpe",
         ascending=False,
@@ -558,100 +695,94 @@ best_row = (
     .iloc[0]
 )
 
-selected_fast_ma = int(best_row["Fast MA"])
-selected_slow_ma = int(best_row["Slow MA"])
+selected_strategy = next(
+    strategy
+    for strategy in strategy_candidates
+    if strategy["name"] == selected_row["Strategy"]
+)
 
 
 # ==========================================
-# SECTION 7 — UNSEEN TEST
+# SECTION 9 — UNSEEN TEST
 # ==========================================
 
-test_results = []
-detailed_test_results = {}
+unseen_rows = []
+unseen_results = {}
 
 for symbol in symbols:
     full_data = market_data[symbol]
     split_position = split_positions[symbol]
+    trade_start = full_data.index[split_position]
 
-    test_start = full_data.index[split_position]
-
-    # Give the test enough PREVIOUS history to calculate MA200 etc.
-    # This warm-up history is read-only: backtest() forbids orders before
-    # test_start, so we are not leaking test performance into training.
-    warmup_rows = selected_slow_ma + 2
-    warmup_start = max(0, split_position - warmup_rows)
-
-    test_with_warmup = full_data.iloc[warmup_start:].copy()
-
-    train_result = backtest(
-        training_data[symbol],
-        selected_fast_ma,
-        selected_slow_ma,
+    # Important:
+    # We pass the FULL dataset so long indicators such as MA200 can
+    # use historical warm-up rows. But trade_start prevents any order
+    # before the unseen test boundary.
+    result = backtest(
+        full_data,
+        selected_strategy,
         starting_cash,
-    )
-
-    test_result = backtest(
-        test_with_warmup,
-        selected_fast_ma,
-        selected_slow_ma,
-        starting_cash,
-        trade_start=test_start,
+        trade_start=trade_start,
         force_close_at_end=True,
     )
 
-    detailed_test_results[symbol] = test_result
+    unseen_results[symbol] = result
 
-    test_results.append({
+    unseen_rows.append({
         "Symbol": symbol,
-        "Train Return": train_result["return"],
-        "Test Return": test_result["return"],
-        "Test Buy & Hold": test_result["benchmark_return"],
-        "Test Sharpe": test_result["sharpe"],
-        "Test Drawdown": test_result["max_drawdown"],
-        "Test Profit Factor": test_result["profit_factor"],
-        "Completed Trades": test_result["trade_count"],
-        "Forced Exit": "YES" if test_result["forced_exit"] else "NO",
-        "Open Position": "YES" if test_result["open_position"] else "NO",
-        "Unrealized P/L": test_result["unrealized_profit"],
-        "Accounting Error": test_result["accounting_error"],
+        "Test Return": result["return"],
+        "Buy & Hold": result["benchmark_return"],
+        "Sharpe": result["sharpe"],
+        "Drawdown": result["max_drawdown"],
+        "Profit Factor": result["profit_factor"],
+        "Trades": result["trade_count"],
+        "Win Rate": result["win_rate"],
+        "Exposure": result["exposure"],
+        "Forced Exit": "YES" if result["forced_exit"] else "NO",
+        "Accounting Error": result["accounting_error"],
     })
 
 
-test_table = pd.DataFrame(test_results)
+unseen_table = pd.DataFrame(unseen_rows)
 
 
 # ==========================================
-# SECTION 8 — GENERALIZATION CHECK
+# SECTION 10 — GENERALIZATION SUMMARY
 # ==========================================
 
-average_train_return = test_table["Train Return"].mean()
-average_test_return = test_table["Test Return"].mean()
-average_test_benchmark = test_table["Test Buy & Hold"].mean()
-average_test_sharpe = test_table["Test Sharpe"].mean()
+average_test_return = unseen_table["Test Return"].mean()
+average_benchmark_return = unseen_table["Buy & Hold"].mean()
+average_test_sharpe = unseen_table["Sharpe"].mean()
+average_test_drawdown = unseen_table["Drawdown"].mean()
+average_test_trades = unseen_table["Trades"].mean()
 
-if average_train_return > 0 and average_test_return <= 0:
+if average_test_return <= 0:
     research_status = (
-        "REJECT FOR NOW: positive training performance "
-        "did not survive unseen testing."
+        "REJECT FOR NOW: average unseen return was not positive."
     )
-elif average_test_return <= 0:
+elif average_test_sharpe <= 0:
     research_status = (
-        "REJECT FOR NOW: average unseen test return was not positive."
+        "REJECT FOR NOW: unseen risk-adjusted performance was not positive."
+    )
+elif average_test_return < average_benchmark_return:
+    research_status = (
+        "KEEP RESEARCHING: positive unseen results, but the strategy "
+        "still underperformed buy & hold."
     )
 else:
     research_status = (
-        "KEEP RESEARCHING: unseen test return was positive, "
-        "but this is not proof of an edge."
+        "PAPER-TRADE CANDIDATE: positive unseen results and average "
+        "outperformance. This is still not proof of a durable edge."
     )
 
 
 # ==========================================
-# SECTION 9 — OUTPUT
+# SECTION 11 — OUTPUT
 # ==========================================
 
 print()
 print("========================================")
-print("V0.6.1 QUANT RESEARCH")
+print("V0.7 MULTI-STRATEGY RESEARCH")
 print("========================================")
 
 print()
@@ -660,114 +791,108 @@ print(f"Training: {train_ratio * 100:.0f}%")
 print(f"Testing: {(1 - train_ratio) * 100:.0f}%")
 
 print()
-print("----- PARAMETER TRAINING RESULTS -----")
-print(
-    parameter_table.to_string(
-        index=False,
-        formatters={
-            "Average Train Return": lambda x: f"{x:.2f}%",
-            "Average Train Sharpe": lambda x: f"{x:.2f}",
-            "Average Train Drawdown": lambda x: f"{x:.2f}%",
-        },
-    )
-)
+print("----- STRATEGY CANDIDATES -----")
+print(training_table.to_string(
+    index=False,
+    formatters={
+        "Average Train Return": lambda x: f"{x:.2f}%",
+        "Average Train Sharpe": lambda x: f"{x:.2f}",
+        "Average Train Drawdown": lambda x: f"{x:.2f}%",
+        "Average Train Trades": lambda x: f"{x:.1f}",
+    },
+))
 
 print()
-print("----- SELECTED STRATEGY -----")
-print(f"MA{selected_fast_ma} / MA{selected_slow_ma}")
-print("Selected using training Sharpe only.")
+print("----- SELECTED CANDIDATE -----")
+print(selected_strategy["name"])
+print(f"Family: {selected_strategy['family']}")
+print("Selected using average TRAINING Sharpe only.")
 
 print()
 print("----- UNSEEN TEST RESULTS -----")
-print(
-    test_table.to_string(
-        index=False,
-        formatters={
-            "Train Return": lambda x: f"{x:.2f}%",
-            "Test Return": lambda x: f"{x:.2f}%",
-            "Test Buy & Hold": lambda x: f"{x:.2f}%",
-            "Test Sharpe": lambda x: f"{x:.2f}",
-            "Test Drawdown": lambda x: f"{x:.2f}%",
-            "Test Profit Factor": lambda x: f"{x:.2f}",
-            "Unrealized P/L": lambda x: f"${x:.2f}",
-            "Accounting Error": lambda x: f"${x:.6f}",
-        },
-    )
-)
+print(unseen_table.to_string(
+    index=False,
+    formatters={
+        "Test Return": lambda x: f"{x:.2f}%",
+        "Buy & Hold": lambda x: f"{x:.2f}%",
+        "Sharpe": lambda x: f"{x:.2f}",
+        "Drawdown": lambda x: f"{x:.2f}%",
+        "Profit Factor": lambda x: (
+            "inf" if x == float("inf") else f"{x:.2f}"
+        ),
+        "Win Rate": lambda x: f"{x:.2f}%",
+        "Exposure": lambda x: f"{x:.2f}%",
+        "Accounting Error": lambda x: f"${x:.8f}",
+    },
+))
 
 print()
 print("----- TEST SUMMARY -----")
-print(f"Average train return: {average_train_return:.2f}%")
-print(f"Average unseen test return: {average_test_return:.2f}%")
-print(f"Average unseen buy & hold: {average_test_benchmark:.2f}%")
+print(f"Average unseen return: {average_test_return:.2f}%")
+print(f"Average buy & hold: {average_benchmark_return:.2f}%")
 print(f"Average unseen Sharpe: {average_test_sharpe:.2f}")
+print(f"Average unseen drawdown: {average_test_drawdown:.2f}%")
+print(f"Average completed trades: {average_test_trades:.1f}")
+print(
+    "Average vs buy & hold: "
+    f"{average_test_return - average_benchmark_return:+.2f} percentage points"
+)
 
 print()
 print("----- RESEARCH STATUS -----")
 print(research_status)
 
-
-# ==========================================
-# SECTION 10 — ACCOUNTING CHECK
-# ==========================================
-
 print()
 print("----- ACCOUNTING CHECK -----")
-
-max_accounting_error = test_table["Accounting Error"].abs().max()
-
+max_accounting_error = unseen_table["Accounting Error"].abs().max()
 print(f"Maximum accounting error: ${max_accounting_error:.8f}")
-
-if max_accounting_error < 0.01:
-    print("Accounting check: PASS")
-else:
-    print("Accounting check: WARNING")
+print(
+    "Accounting check: PASS"
+    if max_accounting_error < 0.01
+    else "Accounting check: WARNING"
+)
 
 
 # ==========================================
-# SECTION 11 — EXAMPLE TRADE HISTORY
+# SECTION 12 — AAPL TEST TRADE HISTORY
 # ==========================================
-
-chart_symbol = symbols[0]
-chart_result = detailed_test_results[chart_symbol]
-chart_trades = chart_result["trades"]
 
 print()
-print(f"----- {chart_symbol} UNSEEN TRADE HISTORY -----")
+print("----- AAPL UNSEEN TRADE HISTORY -----")
 
-if len(chart_trades) == 0:
-    print("No trades.")
+aapl_trades = unseen_results["AAPL"]["trades"]
+
+if len(aapl_trades) == 0:
+    print("No completed AAPL trades.")
 else:
-    print(
-        chart_trades.to_string(
-            index=False,
-            formatters={
-                "Entry Price": lambda x: f"${x:.2f}",
-                "Exit Price": lambda x: f"${x:.2f}",
-                "P/L": lambda x: f"${x:.2f}",
-                "Return %": lambda x: f"{x:.2f}%",
-            },
-        )
-    )
+    print(aapl_trades.to_string(
+        index=False,
+        formatters={
+            "Entry Price": lambda x: f"${x:.2f}",
+            "Exit Price": lambda x: f"${x:.2f}",
+            "P/L": lambda x: f"${x:.2f}",
+            "Return %": lambda x: f"{x:.2f}%",
+        },
+    ))
 
 
 # ==========================================
-# SECTION 12 — EXAMPLE EQUITY CHART
+# SECTION 13 — AAPL EQUITY CHART
 # ==========================================
 
-equity = chart_result["equity_curve"]
+chart_equity = unseen_results["AAPL"]["equity_curve"]
 
 plt.figure(figsize=(14, 7))
 
 plt.plot(
-    equity.index,
-    equity["Strategy"],
-    label="Strategy",
+    chart_equity.index,
+    chart_equity["Strategy"],
+    label=selected_strategy["name"],
 )
 
 plt.plot(
-    equity.index,
-    equity["Benchmark"],
+    chart_equity.index,
+    chart_equity["Benchmark"],
     label="Buy & Hold",
 )
 
@@ -778,8 +903,7 @@ plt.axhline(
 )
 
 plt.title(
-    f"{chart_symbol} — Unseen Test Equity Curve "
-    f"(MA{selected_fast_ma}/MA{selected_slow_ma})"
+    f"AAPL unseen test — {selected_strategy['name']}"
 )
 
 plt.xlabel("Date")
