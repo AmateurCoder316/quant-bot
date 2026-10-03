@@ -1,5 +1,6 @@
 pandas
 yfinance
+requests
 matplotlib
 dash
 plotly
