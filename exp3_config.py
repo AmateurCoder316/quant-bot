@@ -14,6 +14,7 @@ METADATA_PATH = OUTPUT_DIR / "metadata.json"
 SEARCH_RESULTS_PATH = OUTPUT_DIR / "search_results.json"
 EXECUTION_PATH = OUTPUT_DIR / "execution.json"
 STUDY_PATH = OUTPUT_DIR / "study.sqlite3"
+FROZEN_MARKER_PATH = OUTPUT_DIR / "FROZEN_AFTER_2025.txt"
 
 MARKET_TIMEZONE = "America/New_York"
 BAR_MINUTES = 30
