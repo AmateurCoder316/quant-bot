@@ -23,14 +23,12 @@ from PySide6.QtWidgets import (
 )
 import pyqtgraph as pg
 
-from state import DEFAULT_STATE_PATH, DashboardState, Position, load_state
-from styles import (
+from .state import DEFAULT_STATE_PATH, DashboardState, Position, load_state
+from .styles import (
     ACCENT,
     APP_STYLESHEET,
-    BACKGROUND,
     BORDER,
     GREEN,
-    GRID,
     MUTED,
     RED,
     SURFACE,
@@ -278,8 +276,6 @@ class DashboardWindow(QMainWindow):
         try:
             state = load_state(self.state_path)
         except (OSError, ValueError, TypeError):
-            # A malformed/temporary state must never take down the UI. Atomic
-            # writer usage should make this rare, but the reader stays defensive.
             return
 
         self._last_mtime_ns = stat.st_mtime_ns
@@ -344,6 +340,8 @@ def main() -> int:
 
     window = DashboardWindow(args.state)
     window.show()
+    window.raise_()
+    window.activateWindow()
     return app.exec()
 
 
