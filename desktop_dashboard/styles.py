@@ -51,6 +51,31 @@ QLabel#modelValue {{
     font-weight: 600;
 }}
 
+QPushButton#controlButton {{
+    background: {SURFACE};
+    color: {TEXT};
+    border: 1px solid {BORDER};
+    border-radius: 10px;
+    padding: 0 22px;
+    min-width: 92px;
+    min-height: 44px;
+    font-size: 13px;
+    font-weight: 650;
+}}
+
+QPushButton#controlButton:hover {{
+    border-color: #353b44;
+    background: #15181d;
+}}
+
+QPushButton#controlButton[runState="running"] {{
+    color: {RED};
+}}
+
+QPushButton#controlButton[runState="stopped"] {{
+    color: {GREEN};
+}}
+
 QTableWidget {{
     background: {SURFACE};
     alternate-background-color: {SURFACE_ALT};
