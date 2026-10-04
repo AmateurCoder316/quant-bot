@@ -1,14 +1,13 @@
 import csv
 import json
 import logging
-import subprocess
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 
+from desktop_dashboard.state import write_state_atomic
 from market_data import DEFAULT_PROVIDER
 from strategy_core import (
     COMMISSION_RATE,
@@ -30,11 +29,13 @@ POLL_SECONDS = 60
 MIN_BARS = 205
 
 STATE_FILE = Path("paper_state_5m.json")
+LIVE_STATE_FILE = Path("live_state.json")
 LOG_DIR = Path("logs")
 LOG_FILE = LOG_DIR / "paper_trader.log"
 TRADE_CSV = LOG_DIR / "trades.csv"
 EQUITY_CSV = LOG_DIR / "equity.csv"
-DASHBOARD_FILE = Path("dashboard.py")
+MODEL_LABEL = "legacy-rules"
+MAX_EQUITY_POINTS = 1500
 
 
 def setup_logging():
@@ -48,22 +49,6 @@ def setup_logging():
 
 def log_event(message):
     logging.info(message)
-
-
-def launch_dashboard():
-    if not DASHBOARD_FILE.exists():
-        log_event("Dashboard not started: dashboard.py not found")
-        return None
-
-    try:
-        return subprocess.Popen(
-            [sys.executable, str(DASHBOARD_FILE)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        logging.exception("Failed to launch dashboard")
-        return None
 
 
 def fresh_position(last_exit_time=None):
@@ -90,6 +75,7 @@ def fresh_state():
         "positions": {symbol: fresh_position() for symbol in SYMBOLS},
         "trades": [],
         "last_prices": {},
+        "equity_curve": [],
         "market_status": market_session_status(),
         "last_heartbeat": datetime.now().isoformat(),
     }
@@ -112,6 +98,7 @@ def load_state():
         return fresh_state()
 
     state.setdefault("last_prices", {})
+    state.setdefault("equity_curve", [])
     state.setdefault("market_status", market_session_status())
     state.setdefault("last_heartbeat", datetime.now().isoformat())
 
@@ -358,15 +345,21 @@ def process_signal(state, symbol, completed):
 
 
 def save_equity_snapshot(state, prices):
+    timestamp = datetime.now().isoformat()
+    value = portfolio_value(state, prices)
     row = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": timestamp,
         "cash": state["cash"],
-        "portfolio_value": portfolio_value(state, prices),
+        "portfolio_value": value,
         "realized_pnl": state["realized_pnl"],
         "unrealized_pnl": unrealized_pnl(state, prices),
         "open_positions": open_position_count(state),
         "market_status": state.get("market_status", "UNKNOWN"),
     }
+
+    curve = state.setdefault("equity_curve", [])
+    curve.append({"timestamp": timestamp, "value": value})
+    del curve[:-MAX_EQUITY_POINTS]
 
     file_exists = EQUITY_CSV.exists()
     with EQUITY_CSV.open("a", newline="", encoding="utf-8") as file:
@@ -374,6 +367,50 @@ def save_equity_snapshot(state, prices):
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
+
+
+def publish_dashboard_state(state, prices):
+    value = portfolio_value(state, prices)
+    total_pnl = value - STARTING_CASH
+    positions = []
+
+    for symbol in SYMBOLS:
+        position = state["positions"][symbol]
+        shares = float(position.get("shares", 0.0) or 0.0)
+        if shares <= 0:
+            continue
+
+        entry_price = float(position.get("entry_price", 0.0) or 0.0)
+        current_price = float(prices.get(symbol, entry_price) or entry_price)
+        market_value = shares * current_price
+        entry_total_cost = float(position.get("entry_total_cost", 0.0) or 0.0)
+        pnl = market_value - entry_total_cost
+        pnl_percent = pnl / entry_total_cost * 100.0 if entry_total_cost else 0.0
+
+        positions.append(
+            {
+                "symbol": symbol,
+                "quantity": shares,
+                "entry_price": entry_price,
+                "current_price": current_price,
+                "market_value": market_value,
+                "profit_loss": pnl,
+                "profit_loss_percent": pnl_percent,
+            }
+        )
+
+    write_state_atomic(
+        LIVE_STATE_FILE,
+        {
+            "portfolio_value": value,
+            "starting_value": STARTING_CASH,
+            "profit_loss": total_pnl,
+            "profit_loss_percent": total_pnl / STARTING_CASH * 100.0,
+            "model": MODEL_LABEL,
+            "equity_curve": state.get("equity_curve", []),
+            "positions": positions,
+        },
+    )
 
 
 def print_money_summary(state, prices):
@@ -414,7 +451,7 @@ def print_money_summary(state, prices):
     if not any_position:
         print("None")
 
-    print("\nDashboard: http://127.0.0.1:8050")
+    print("\nDesktop dashboard is managed by bot.py")
     print("Ctrl+C to stop")
 
 
@@ -445,7 +482,6 @@ def run_open_market_check(state):
         _, completed = market_data[symbol]
         process_signal(state, symbol, completed)
 
-    save_equity_snapshot(state, prices)
     return prices
 
 
@@ -458,15 +494,15 @@ def run_once(state):
     else:
         prices = state.get("last_prices", {})
 
+    save_equity_snapshot(state, prices)
     save_state(state)
+    publish_dashboard_state(state, prices)
     print_money_summary(state, prices)
 
 
 def main():
     setup_logging()
     state = load_state()
-    dashboard_process = launch_dashboard()
-
     log_event("5-minute paper trader started")
 
     try:
@@ -477,17 +513,15 @@ def main():
                 logging.exception("Live check failed")
                 state["market_status"] = "ERROR"
                 save_state(state)
+                publish_dashboard_state(state, state.get("last_prices", {}))
                 print(f"\nCheck failed: {error}")
 
             time.sleep(POLL_SECONDS)
 
     except KeyboardInterrupt:
         save_state(state)
+        publish_dashboard_state(state, state.get("last_prices", {}))
         log_event("5-minute paper trader stopped")
-
-        if dashboard_process is not None and dashboard_process.poll() is None:
-            dashboard_process.terminate()
-
         print("\nPaper trader stopped.")
         print(f"State saved to {STATE_FILE}")
 
