@@ -1,0 +1,8 @@
+# EXP-2-M2 training lab
+# Install inside the existing venv with:
+#   pip install -r requirements-exp2-m2.txt
+
+optuna>=4.0
+xgboost>=2.0
+lightgbm>=4.0
+catboost>=1.2
