@@ -4,6 +4,7 @@ import os
 import shutil
 import time
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -14,10 +15,12 @@ from urllib3.util.retry import Retry
 from exp4_config import ALL_SYMBOLS, LEGACY_5M_DIR, SOURCE_5M_DIR
 
 
-# Load a repo-local .env automatically while preserving any variables already
-# exported in the shell. This keeps credentials out of source code and avoids
-# requiring a manual `set -x`/`export` every new terminal session.
-load_dotenv(override=False)
+# Load credentials from the repository directory regardless of the shell's
+# current working directory. Existing exported variables always win.
+REPO_DIR = Path(__file__).resolve().parent
+for env_path in (REPO_DIR / ".env", REPO_DIR / ".env.local"):
+    if env_path.exists():
+        load_dotenv(env_path, override=False)
 
 BASE_URL = "https://data.alpaca.markets/v2/stocks/{symbol}/bars"
 TIMEFRAME = "5Min"
@@ -29,14 +32,43 @@ REQUEST_PAUSE_SECONDS = 0.25
 MAX_ATTEMPTS = 6
 
 
+def _first_env(*names: str) -> tuple[str | None, str | None]:
+    for name in names:
+        value = os.getenv(name)
+        if value and value.strip():
+            return value.strip(), name
+    return None, None
+
+
 def credentials() -> tuple[str, str]:
-    key = os.getenv("APCA_API_KEY_ID")
-    secret = os.getenv("APCA_API_SECRET_KEY")
+    # APCA_* are Alpaca's standard environment-variable names. The ALPACA_*
+    # aliases make this compatible with the naming commonly used in .env files.
+    key, key_name = _first_env(
+        "APCA_API_KEY_ID",
+        "ALPACA_API_KEY_ID",
+        "ALPACA_API_KEY",
+        "ALPACA_KEY_ID",
+        "ALPACA_KEY",
+    )
+    secret, secret_name = _first_env(
+        "APCA_API_SECRET_KEY",
+        "ALPACA_API_SECRET_KEY",
+        "ALPACA_SECRET_KEY",
+        "ALPACA_API_SECRET",
+        "ALPACA_SECRET",
+    )
     if not key or not secret:
+        checked_files = [str(path) for path in (REPO_DIR / ".env", REPO_DIR / ".env.local") if path.exists()]
+        checked_text = ", ".join(checked_files) if checked_files else "no .env/.env.local file found"
         raise RuntimeError(
-            "Missing Alpaca credentials. Add APCA_API_KEY_ID and "
-            "APCA_API_SECRET_KEY to the repo .env file or export them in your shell."
+            "Missing Alpaca credentials. Checked exported environment variables and "
+            f"repo env files ({checked_text}).\n"
+            "Accepted key names: APCA_API_KEY_ID, ALPACA_API_KEY_ID, ALPACA_API_KEY, "
+            "ALPACA_KEY_ID, ALPACA_KEY.\n"
+            "Accepted secret names: APCA_API_SECRET_KEY, ALPACA_API_SECRET_KEY, "
+            "ALPACA_SECRET_KEY, ALPACA_API_SECRET, ALPACA_SECRET."
         )
+    print(f"Alpaca credentials loaded from {key_name} / {secret_name} (values hidden).")
     return key, secret
 
 
