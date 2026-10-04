@@ -1,0 +1,296 @@
+from __future__ import annotations
+
+import json
+import os
+
+import numpy as np
+import optuna
+import pandas as pd
+
+from exp3_m2_config import (
+    BATCH_SIZES,
+    CV_BLOCK_MONTHS,
+    CV_MIN_TRAIN_ROWS,
+    CV_VALIDATION_YEAR,
+    DATASET_PATH,
+    DEFAULT_TRIALS,
+    DROPOUT_RANGE,
+    FROZEN_MARKER_PATH,
+    METADATA_PATH,
+    MODEL_NAME,
+    MODEL_PATH,
+    OUTPUT_DIR,
+    RANK_WEIGHT_RANGE,
+    RESIDUAL_BLOCKS,
+    SCALER_PATH,
+    SEARCH_RESULTS_PATH,
+    SEARCH_SEED,
+    STUDY_PATH,
+    TARGET_2H,
+    TRAIN_YEARS,
+    TUNE_YEAR,
+    WIDTHS,
+)
+from exp3_m2_model import (
+    choose_device,
+    choose_final_epochs,
+    fit_full_model,
+    make_cv_folds,
+    predict_dataframe,
+    save_model_bundle,
+    summarize_fold_metrics,
+    tail_metrics,
+    train_one_model,
+)
+
+
+def completed_trials(study: optuna.Study) -> list[optuna.trial.FrozenTrial]:
+    return [
+        trial
+        for trial in study.trials
+        if trial.state == optuna.trial.TrialState.COMPLETE and trial.value is not None
+    ]
+
+
+def choose_winner(study: optuna.Study) -> tuple[optuna.trial.FrozenTrial, bool]:
+    complete = completed_trials(study)
+    eligible = [trial for trial in complete if bool(trial.user_attrs.get("eligible", False))]
+    if eligible:
+        return max(eligible, key=lambda trial: float(trial.value)), True
+    if not complete:
+        raise RuntimeError("No completed EXP-3-M2 trials are available.")
+    return max(complete, key=lambda trial: float(trial.value)), False
+
+
+def trial_params(trial: optuna.Trial) -> dict:
+    return {
+        "width": trial.suggest_categorical("width", WIDTHS),
+        "blocks": trial.suggest_categorical("blocks", RESIDUAL_BLOCKS),
+        "dropout": trial.suggest_float("dropout", *DROPOUT_RANGE),
+        "learning_rate": trial.suggest_float("learning_rate", 5e-5, 1e-3, log=True),
+        "weight_decay": trial.suggest_float("weight_decay", 1e-6, 3e-3, log=True),
+        "batch_size": trial.suggest_categorical("batch_size", BATCH_SIZES),
+        "rank_weight": trial.suggest_float("rank_weight", *RANK_WEIGHT_RANGE),
+    }
+
+
+def main() -> None:
+    if FROZEN_MARKER_PATH.exists():
+        raise SystemExit(
+            "EXP-3-M2 is already frozen after its first 2025 evaluation. "
+            "Do not retrain M2; create EXP-3-M3 for further model changes."
+        )
+    if not DATASET_PATH.exists():
+        raise SystemExit(
+            f"Missing {DATASET_PATH}. Build EXP-3-M1 dataset first with "
+            "python build_exp_3_dataset.py"
+        )
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    data = pd.read_parquet(DATASET_PATH).sort_index()
+    train_search = data[data["year"].isin(TRAIN_YEARS)].copy()
+    forward_2025 = data[data["year"] == TUNE_YEAR].copy()
+
+    folds = make_cv_folds(
+        train_search,
+        validation_year=CV_VALIDATION_YEAR,
+        block_months=CV_BLOCK_MONTHS,
+        min_train_rows=CV_MIN_TRAIN_ROWS,
+    )
+    if len(folds) < 3:
+        raise RuntimeError(f"Only {len(folds)} CV folds were built; expected at least 3.")
+
+    device = choose_device()
+    requested_trials = int(os.getenv("EXP3_M2_TRIALS", DEFAULT_TRIALS))
+
+    print("=" * 122)
+    print("EXP-3-M2 - LARGE 30-MINUTE RESIDUAL NEURAL NETWORK")
+    print("=" * 122)
+    print("Core changes from M1:")
+    print("  - million-parameter residual MLP instead of ~12k-parameter MLP")
+    print("  - 30..180 epochs per fold with economic early stopping")
+    print("  - regression + pairwise ranking loss")
+    print("  - checkpoint chosen by top-tail after-cost returns + score ordering")
+    print("  - final full-data model trains at least 50 epochs")
+    print(f"Train/search years: {TRAIN_YEARS}")
+    print(f"First forward year: {TUNE_YEAR} (not used by model search)")
+    print(f"Training/search rows: {len(train_search):,}")
+    print(f"2025 held-out rows:   {len(forward_2025):,}")
+    print(f"Purged CV folds:      {len(folds)}")
+    print(f"Device:               {device}")
+    print(f"Search budget:        {requested_trials} total trials")
+    print()
+    for fold in folds:
+        print(
+            f"  {fold['name']:<18} train={len(fold['train_indices']):>7,} "
+            f"validation={len(fold['validation_indices']):>6,}"
+        )
+
+    storage = f"sqlite:///{STUDY_PATH.resolve()}"
+    study = optuna.create_study(
+        study_name=MODEL_NAME,
+        storage=storage,
+        load_if_exists=True,
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=SEARCH_SEED),
+    )
+
+    def objective(trial: optuna.Trial) -> float:
+        params = trial_params(trial)
+        fold_metrics = []
+        best_epochs = []
+
+        for fold_number, fold in enumerate(folds, start=1):
+            train_fold = train_search.iloc[fold["train_indices"]]
+            valid_fold = train_search.iloc[fold["validation_indices"]]
+            _, _, _, best_epoch, metrics = train_one_model(
+                train_fold,
+                valid_fold,
+                params,
+                seed=SEARCH_SEED + trial.number * 100 + fold_number,
+                device=device,
+            )
+            metrics["fold"] = fold["name"]
+            fold_metrics.append(metrics)
+            best_epochs.append(int(best_epoch))
+
+        summary = summarize_fold_metrics(fold_metrics)
+        trial.set_user_attr("eligible", bool(summary["eligible"]))
+        trial.set_user_attr("summary", summary)
+        trial.set_user_attr("fold_metrics", fold_metrics)
+        trial.set_user_attr("best_epochs", best_epochs)
+        return float(summary["objective"])
+
+    already_complete = len(completed_trials(study))
+    remaining = max(0, requested_trials - already_complete)
+    print("\n" + "=" * 122)
+    print("LARGE-NET HYPERPARAMETER SEARCH - 2023/2024 ONLY")
+    print("=" * 122)
+    print(f"Completed previously: {already_complete} | remaining now: {remaining}")
+    if remaining:
+        study.optimize(objective, n_trials=remaining, n_jobs=1, gc_after_trial=True)
+
+    winner, training_gate_pass = choose_winner(study)
+    params = dict(winner.params)
+    summary = dict(winner.user_attrs["summary"])
+    best_epochs = [int(value) for value in winner.user_attrs["best_epochs"]]
+    final_epochs = choose_final_epochs(best_epochs)
+
+    print("\n" + "=" * 122)
+    print("EXP-3-M2 TRAINING SEARCH WINNER")
+    print("=" * 122)
+    print(f"Trial:                    {winner.number}")
+    print(f"Training economic gate:   {'PASS' if training_gate_pass else 'FAIL - best diagnostic only'}")
+    print(f"Objective:                {float(winner.value):+.4f}")
+    print(f"Mean score-vs-return:     {summary['mean_spearman']:+.4f}")
+    print(f"Top 10% avg net:          {summary['mean_top10'] * 100:+.3f}%")
+    print(f"Top  5% avg net:          {summary['mean_top05'] * 100:+.3f}%")
+    print(f"Worst fold top 10%:       {summary['worst_top10'] * 100:+.3f}%")
+    print(f"Positive top-10% folds:   {summary['positive_fold_fraction'] * 100:.1f}%")
+    print(f"Best epochs by fold:      {best_epochs}")
+    print(f"Final full-data epochs:   {final_epochs}")
+    print(f"Width / residual blocks:  {params['width']} / {params['blocks']}")
+    print(f"Dropout:                  {params['dropout']:.3f}")
+    print(f"Learning rate:            {params['learning_rate']:.6g}")
+    print(f"Weight decay:             {params['weight_decay']:.6g}")
+    print(f"Batch size:               {params['batch_size']}")
+    print(f"Ranking-loss weight:      {params['rank_weight']:.3f}")
+
+    model, feature_scaler, target_scaler = fit_full_model(
+        train_search,
+        params,
+        final_epochs,
+        seed=SEARCH_SEED + 99_999,
+        device=device,
+    )
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+
+    metadata = {
+        "model_name": MODEL_NAME,
+        "train_years": TRAIN_YEARS,
+        "tune_year": TUNE_YEAR,
+        "winner_trial": int(winner.number),
+        "training_gate_pass": bool(training_gate_pass),
+        "training_summary": summary,
+        "winner_best_epochs": best_epochs,
+        "final_epochs": int(final_epochs),
+        "parameter_count": int(parameter_count),
+        "device_used_for_training": str(device),
+    }
+    save_model_bundle(
+        model,
+        feature_scaler,
+        target_scaler,
+        params,
+        MODEL_PATH,
+        SCALER_PATH,
+        METADATA_PATH,
+        metadata,
+    )
+
+    search_export = {
+        "requested_trials": requested_trials,
+        "completed_trials": len(completed_trials(study)),
+        "winner_trial": int(winner.number),
+        "training_gate_pass": bool(training_gate_pass),
+        "winner_params": params,
+        "winner_summary": summary,
+        "winner_fold_metrics": winner.user_attrs["fold_metrics"],
+        "winner_best_epochs": best_epochs,
+        "final_epochs": int(final_epochs),
+        "parameter_count": int(parameter_count),
+    }
+    SEARCH_RESULTS_PATH.write_text(json.dumps(search_export, indent=2), encoding="utf-8")
+
+    print(f"\nFrozen model parameters: {parameter_count:,}")
+    print(f"Saved model:             {MODEL_PATH}")
+    print(f"Saved metadata:          {METADATA_PATH}")
+    print(f"Saved search results:    {SEARCH_RESULTS_PATH}")
+
+    # From this point onward the model is frozen. 2025 is first revealed here.
+    prediction_2025 = predict_dataframe(
+        model, feature_scaler, target_scaler, forward_2025, device
+    )
+    prediction_path = OUTPUT_DIR / "predictions_2025.parquet"
+    prediction_2025.to_parquet(prediction_path)
+    metrics_2025 = tail_metrics(
+        prediction_2025["pred_net_2h"].to_numpy(),
+        prediction_2025[TARGET_2H].to_numpy(),
+    )
+
+    FROZEN_MARKER_PATH.write_text(
+        "EXP-3-M2 was frozen when 2025 predictions were first generated.\n"
+        "Do not retrain or alter M2 based on 2025/2026 results.\n",
+        encoding="utf-8",
+    )
+
+    print("\n" + "=" * 122)
+    print("FIRST FORWARD MODEL EVALUATION - 2025")
+    print("=" * 122)
+    print(f"Rows:                    {metrics_2025['rows']:,}")
+    print(f"Score-vs-return rank:    {metrics_2025['spearman']:+.4f}")
+    print(f"Mean absolute error:     {metrics_2025['mae'] * 100:.3f}%")
+    print(
+        f"Top 10%: avg_net={metrics_2025['top10_mean'] * 100:+.3f}% "
+        f"median_net={metrics_2025['top10_median'] * 100:+.3f}% "
+        f"positive={metrics_2025['top10_positive'] * 100:.1f}%"
+    )
+    print(
+        f"Top  5%: avg_net={metrics_2025['top05_mean'] * 100:+.3f}% "
+        f"median_net={metrics_2025['top05_median'] * 100:+.3f}% "
+        f"positive={metrics_2025['top05_positive'] * 100:.1f}%"
+    )
+    print("\n2025 predicted 2h net-return distribution:")
+    for percentile in (50, 75, 90, 95, 97.5, 99):
+        value = np.percentile(prediction_2025["pred_net_2h"], percentile)
+        print(f"  p{percentile:>4}: {value * 100:+.3f}%")
+
+    print("\n" + "=" * 122)
+    print("EXP-3-M2 MODEL FROZEN")
+    print("=" * 122)
+    print("Do not change M2 architecture, loss or hyperparameters based on 2025 results.")
+    print("Next: python tune_exp_3_m2.py")
+
+
+if __name__ == "__main__":
+    main()
