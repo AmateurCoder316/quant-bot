@@ -11,7 +11,6 @@ from exp4_config import (
     COMMISSION_RATE,
     CONTEXT_SYMBOLS,
     FEATURE_COLUMNS,
-    INPUT_BARS_PER_OUTPUT_BAR,
     LEGACY_5M_DIR,
     MAIN_HORIZON_BARS,
     MARKET_TIMEZONE,
@@ -51,7 +50,23 @@ def load_5m(symbol: str) -> pd.DataFrame:
     return frame[~frame.index.duplicated(keep="last")].sort_index().dropna()
 
 
+def _scheduled_bar_timestamp(session_date, bar_number: int) -> pd.Timestamp:
+    """Return the exact scheduled start of a US regular-session 30-minute bar."""
+    midnight = pd.Timestamp(session_date).tz_localize(MARKET_TIMEZONE)
+    local = midnight + pd.Timedelta(minutes=SESSION_OPEN_MINUTE + 30 * int(bar_number))
+    return local.tz_convert("UTC")
+
+
 def resample_30m(frame_5m: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate sparse IEX 5-minute trade bars into scheduled 30-minute bars.
+
+    Alpaca/IEX can omit a 5-minute child interval when no qualifying IEX trade
+    occurred. Requiring exactly six child rows therefore throws away otherwise
+    valid half-hour candles. A 30-minute trade bar should instead aggregate all
+    trades observed in that half-hour. We keep the scheduled bucket timestamp so
+    different symbols and context ETFs align even when their first observed child
+    bar occurs a few minutes after the bucket boundary.
+    """
     local = frame_5m.copy()
     local.index = local.index.tz_convert(MARKET_TIMEZONE)
     minutes = local.index.hour * 60 + local.index.minute
@@ -63,18 +78,22 @@ def resample_30m(frame_5m: pd.DataFrame) -> pd.DataFrame:
 
     rows = []
     for (session_date, bar_number), group in local.groupby(["session_date", "bar_in_session"], sort=True):
+        bar_number = int(bar_number)
+        if not 0 <= bar_number < SESSION_BARS:
+            continue
         group = group.sort_index()
-        if not 0 <= int(bar_number) < SESSION_BARS or len(group) != INPUT_BARS_PER_OUTPUT_BAR:
+        if group.empty:
             continue
         rows.append({
-            "Timestamp": group.index[0].tz_convert("UTC"),
+            "Timestamp": _scheduled_bar_timestamp(session_date, bar_number),
             "Open": float(group["Open"].iloc[0]),
             "High": float(group["High"].max()),
             "Low": float(group["Low"].min()),
             "Close": float(group["Close"].iloc[-1]),
             "Volume": float(group["Volume"].sum()),
             "session_date": str(session_date),
-            "bar_in_session": int(bar_number),
+            "bar_in_session": bar_number,
+            "source_5m_count": int(len(group)),
         })
     if not rows:
         return pd.DataFrame(columns=OHLCV)
@@ -159,23 +178,51 @@ def _net_return(entry_open: pd.Series, exit_open: pd.Series) -> pd.Series:
     return exit_cash / entry_cash - 1
 
 
+def _lookup_same_session_bar(result: pd.DataFrame, bar_offset: int) -> tuple[pd.Series, pd.Series]:
+    """Look up an exact future scheduled bar in the same session.
+
+    `bar_offset=1` means the next 30-minute bar. Missing scheduled bars stay
+    missing rather than silently turning an N-bar horizon into a longer horizon.
+    """
+    working = result.copy()
+    working["_timestamp_lookup"] = working.index
+    lookup = working.set_index(["session_date", "bar_in_session"])
+    wanted_bar = working["bar_in_session"].astype(int) + int(bar_offset)
+    keys = pd.MultiIndex.from_arrays(
+        [working["session_date"].to_numpy(), wanted_bar.to_numpy()],
+        names=["session_date", "bar_in_session"],
+    )
+    open_values = lookup["Open"].reindex(keys).to_numpy(dtype=float)
+    time_values = pd.to_datetime(
+        lookup["_timestamp_lookup"].reindex(keys).to_numpy(),
+        utc=True,
+        errors="coerce",
+    )
+    return (
+        pd.Series(open_values, index=result.index, dtype=float),
+        pd.Series(time_values, index=result.index),
+    )
+
+
 def add_targets(data: pd.DataFrame) -> pd.DataFrame:
     result = data.copy().sort_index()
-    entry_open = result["Open"].shift(-1)
-    entry_time = pd.Series(result.index, index=result.index).shift(-1)
-    entry_session = result["session_date"].shift(-1)
+
+    entry_open, entry_time = _lookup_same_session_bar(result, 1)
     result["entry_open"] = entry_open
     result["entry_time"] = entry_time
-    for horizon, name, suffix in ((AUX_2H_BARS, TARGET_2H, "2h"), (MAIN_HORIZON_BARS, TARGET_4H, "4h")):
-        shift = -(1 + horizon)
-        exit_open = result["Open"].shift(shift)
-        exit_time = pd.Series(result.index, index=result.index).shift(shift)
-        exit_session = result["session_date"].shift(shift)
-        valid = entry_session.eq(exit_session) & entry_open.notna() & exit_open.notna()
+
+    for horizon, name, suffix in (
+        (AUX_2H_BARS, TARGET_2H, "2h"),
+        (MAIN_HORIZON_BARS, TARGET_4H, "4h"),
+    ):
+        # Entry is the next bar, then hold exactly `horizon` 30-minute bars.
+        exit_open, exit_time = _lookup_same_session_bar(result, 1 + horizon)
+        valid = entry_open.notna() & exit_open.notna()
         result[name] = _net_return(entry_open, exit_open).where(valid)
         result[f"target_gross_{suffix}"] = (exit_open / entry_open - 1).where(valid)
         result[f"exit_open_{suffix}"] = exit_open.where(valid)
         result[f"exit_time_{suffix}"] = exit_time.where(valid)
+
     result["label_end_time"] = result["exit_time_4h"]
     return result
 
@@ -224,8 +271,11 @@ def build_dataset() -> pd.DataFrame:
             frame = frame.join(ctx, how="left")
         sector = featured[SECTOR_ETF_BY_SYMBOL[symbol]]
         sector_context = pd.DataFrame(index=sector.index, data={
-            "sector_ret1": sector["ret_1"], "sector_ret4": sector["ret_4"], "sector_ret8": sector["ret_8"],
-            "sector_rv13": sector["rv13"], "sector_ema13_26": sector["ema13_26_spread"],
+            "sector_ret1": sector["ret_1"],
+            "sector_ret4": sector["ret_4"],
+            "sector_ret8": sector["ret_8"],
+            "sector_rv13": sector["rv13"],
+            "sector_ema13_26": sector["ema13_26_spread"],
         })
         frame = frame.join(sector_context, how="left")
         frame["rel_spy_1"] = frame["ret_1"] - frame["spy_ret1"]
