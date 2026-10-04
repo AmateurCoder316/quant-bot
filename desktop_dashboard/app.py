@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QMainWindow,
+    QPushButton,
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 import pyqtgraph as pg
 
+from .control import DEFAULT_CONTROL_PATH, load_control, write_control
 from .state import DEFAULT_STATE_PATH, DashboardState, Position, load_state
 from .styles import (
     ACCENT,
@@ -75,11 +77,11 @@ class MoneyAxis(pg.AxisItem):
         for value in values:
             absolute = abs(value)
             if absolute >= 1_000_000:
-                output.append(f"${value / 1_000_000:.1f}m")
+                output.append(f"€{value / 1_000_000:.1f}m")
             elif absolute >= 1_000:
-                output.append(f"${value / 1_000:.1f}k")
+                output.append(f"€{value / 1_000:.1f}k")
             else:
-                output.append(f"${value:,.0f}")
+                output.append(f"€{value:,.0f}")
         return output
 
 
@@ -215,10 +217,12 @@ class PositionsTable(QFrame):
 
 
 class DashboardWindow(QMainWindow):
-    def __init__(self, state_path: Path):
+    def __init__(self, state_path: Path, control_path: Path):
         super().__init__()
         self.state_path = Path(state_path)
+        self.control_path = Path(control_path)
         self._last_mtime_ns: int | None = None
+        self._desired_running = True
 
         self.setWindowTitle("Quant Bot")
         self.setMinimumSize(1020, 680)
@@ -238,14 +242,25 @@ class DashboardWindow(QMainWindow):
         metrics.setColumnStretch(0, 1)
         metrics.setColumnStretch(1, 1)
         metrics.setColumnStretch(2, 1)
+        metrics.setColumnStretch(3, 0)
 
         self.portfolio_card = MetricCard("Portfolio value")
         self.profit_card = MetricCard("P/L")
         self.model_card = MetricCard("Model", model_card=True)
+        self.control_button = QPushButton()
+        self.control_button.setObjectName("controlButton")
+        self.control_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.control_button.clicked.connect(self.toggle_running)
 
         metrics.addWidget(self.portfolio_card, 0, 0)
         metrics.addWidget(self.profit_card, 0, 1)
         metrics.addWidget(self.model_card, 0, 2)
+        metrics.addWidget(
+            self.control_button,
+            0,
+            3,
+            alignment=Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+        )
 
         self.graph = EquityGraph()
         self.positions = PositionsTable()
@@ -260,9 +275,33 @@ class DashboardWindow(QMainWindow):
         self.timer.start()
 
         self.apply_state(DashboardState())
+        self.refresh_control()
         self.refresh(force=True)
 
+    def toggle_running(self) -> None:
+        self._desired_running = not self._desired_running
+        write_control(self.control_path, self._desired_running)
+        self.apply_control_state()
+
+    def refresh_control(self) -> None:
+        control = load_control(self.control_path)
+        if control.running != self._desired_running:
+            self._desired_running = control.running
+            self.apply_control_state()
+        elif not self.control_button.text():
+            self.apply_control_state()
+
+    def apply_control_state(self) -> None:
+        self.control_button.setText("Stop" if self._desired_running else "Start")
+        self.control_button.setProperty(
+            "runState",
+            "running" if self._desired_running else "stopped",
+        )
+        self.control_button.style().unpolish(self.control_button)
+        self.control_button.style().polish(self.control_button)
+
     def refresh(self, force: bool = False) -> None:
+        self.refresh_control()
         try:
             stat = self.state_path.stat()
         except FileNotFoundError:
@@ -295,12 +334,12 @@ class DashboardWindow(QMainWindow):
 
 
 def _format_money(value: float) -> str:
-    return f"${value:,.2f}"
+    return f"€{value:,.2f}"
 
 
 def _format_signed_money(value: float) -> str:
     sign = "+" if value > 0 else "-" if value < 0 else ""
-    return f"{sign}${abs(value):,.2f}"
+    return f"{sign}€{abs(value):,.2f}"
 
 
 def _format_signed_percent(value: float) -> str:
@@ -309,7 +348,7 @@ def _format_signed_percent(value: float) -> str:
 
 
 def _format_price(value: float) -> str:
-    return f"${value:,.2f}"
+    return f"€{value:,.2f}"
 
 
 def _format_quantity(value: float) -> str:
@@ -326,6 +365,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_STATE_PATH,
         help=f"Live state JSON path (default: {DEFAULT_STATE_PATH})",
     )
+    parser.add_argument(
+        "--control",
+        type=Path,
+        default=DEFAULT_CONTROL_PATH,
+        help=f"Bot control JSON path (default: {DEFAULT_CONTROL_PATH})",
+    )
     return parser.parse_args()
 
 
@@ -338,7 +383,7 @@ def main() -> int:
     app.setStyle("Fusion")
     app.setStyleSheet(APP_STYLESHEET)
 
-    window = DashboardWindow(args.state)
+    window = DashboardWindow(args.state, args.control)
     window.show()
     window.raise_()
     window.activateWindow()
