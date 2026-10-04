@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 import pyqtgraph as pg
 
 from .control import DEFAULT_CONTROL_PATH, load_control, write_control
+from .currency import get_usd_to_eur_rate
 from .state import DEFAULT_STATE_PATH, DashboardState, Position, load_state
 from .styles import (
     ACCENT,
@@ -125,14 +126,14 @@ class EquityGraph(QFrame):
         )
         layout.addWidget(self.plot)
 
-    def set_state(self, state: DashboardState) -> None:
+    def set_state(self, state: DashboardState, usd_to_eur: float) -> None:
         points = [point for point in state.equity_curve if point.timestamp > 0]
         if not points:
             self.curve.setData([], [])
             return
 
         x = [point.timestamp for point in points]
-        y = [point.value for point in points]
+        y = [point.value * usd_to_eur for point in points]
         color = GREEN if state.profit_loss > 0 else RED if state.profit_loss < 0 else ACCENT
         self.curve.setPen(pg.mkPen(color, width=2))
         self.curve.setData(x, y)
@@ -186,7 +187,7 @@ class PositionsTable(QFrame):
             item.setFont(font)
         return item
 
-    def set_positions(self, positions: list[Position]) -> None:
+    def set_positions(self, positions: list[Position], usd_to_eur: float) -> None:
         self.table.setUpdatesEnabled(False)
         try:
             self.table.setRowCount(len(positions))
@@ -199,12 +200,15 @@ class PositionsTable(QFrame):
                 )
                 self.table.setItem(row, 0, symbol_item)
                 self.table.setItem(row, 1, self._cell(_format_quantity(position.quantity)))
-                self.table.setItem(row, 2, self._cell(_format_price(position.entry_price)))
-                self.table.setItem(row, 3, self._cell(_format_price(position.current_price)))
+                self.table.setItem(row, 2, self._cell(_format_price(position.entry_price * usd_to_eur)))
+                self.table.setItem(row, 3, self._cell(_format_price(position.current_price * usd_to_eur)))
                 self.table.setItem(
                     row,
                     4,
-                    self._cell(_format_signed_money(position.profit_loss), color=pl_color),
+                    self._cell(
+                        _format_signed_money(position.profit_loss * usd_to_eur),
+                        color=pl_color,
+                    ),
                 )
                 self.table.setItem(
                     row,
@@ -223,6 +227,7 @@ class DashboardWindow(QMainWindow):
         self.control_path = Path(control_path)
         self._last_mtime_ns: int | None = None
         self._desired_running = True
+        self.usd_to_eur = get_usd_to_eur_rate()
 
         self.setWindowTitle("Quant Bot")
         self.setMinimumSize(1020, 680)
@@ -321,16 +326,19 @@ class DashboardWindow(QMainWindow):
         self.apply_state(state)
 
     def apply_state(self, state: DashboardState) -> None:
-        self.portfolio_card.set_value(_format_money(state.portfolio_value))
+        self.portfolio_card.set_value(
+            _format_money(state.portfolio_value * self.usd_to_eur)
+        )
 
         pl_color = GREEN if state.profit_loss > 0 else RED if state.profit_loss < 0 else TEXT
         self.profit_card.set_value(
-            f"{_format_signed_money(state.profit_loss)}  {_format_signed_percent(state.profit_loss_percent)}",
+            f"{_format_signed_money(state.profit_loss * self.usd_to_eur)}  "
+            f"{_format_signed_percent(state.profit_loss_percent)}",
             pl_color,
         )
         self.model_card.set_value(state.model)
-        self.graph.set_state(state)
-        self.positions.set_positions(state.positions)
+        self.graph.set_state(state, self.usd_to_eur)
+        self.positions.set_positions(state.positions, self.usd_to_eur)
 
 
 def _format_money(value: float) -> str:
