@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import statistics
-from pathlib import Path
 
 import numpy as np
 import optuna
@@ -17,6 +16,7 @@ from exp3_config import (
     CV_VALIDATION_YEAR,
     DATASET_PATH,
     DEFAULT_TRIALS,
+    FROZEN_MARKER_PATH,
     HIDDEN_LAYOUTS,
     METADATA_PATH,
     MODEL_NAME,
@@ -82,6 +82,12 @@ def choose_winner(study: optuna.Study) -> tuple[optuna.trial.FrozenTrial, bool]:
 
 
 def main() -> None:
+    if FROZEN_MARKER_PATH.exists():
+        raise SystemExit(
+            "EXP-3-M1 is already frozen after its first 2025 reveal. "
+            "Do not add trials or retrain this model name. Any model change is EXP-3-M2."
+        )
+
     if not DATASET_PATH.exists():
         raise SystemExit(
             f"Missing {DATASET_PATH}. Run: python build_exp_3_dataset.py"
@@ -249,6 +255,11 @@ def main() -> None:
     metrics_2025 = tail_metrics(
         prediction_2025["pred_net_2h"].to_numpy(),
         prediction_2025[TARGET_2H].to_numpy(),
+    )
+
+    FROZEN_MARKER_PATH.write_text(
+        "EXP-3-M1 architecture, features, targets and hyperparameters froze when 2025 was first revealed.\n",
+        encoding="utf-8",
     )
 
     print("\n" + "=" * 118)
