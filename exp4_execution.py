@@ -35,26 +35,25 @@ class OpenPosition:
 
 
 def apply_causal_percentile(predictions: pd.DataFrame, percentile: float) -> pd.DataFrame:
+    """Apply a rolling threshold using only scores from strictly earlier timestamps."""
     data = predictions.sort_index().copy()
     data["selected"] = False
     data["causal_threshold"] = np.nan
     history: deque[float] = deque(maxlen=ROLLING_EVENT_WINDOW)
+    selected_col = data.columns.get_loc("selected")
+    threshold_col = data.columns.get_loc("causal_threshold")
 
-    for timestamp, group in data.groupby(level=0, sort=True):
+    # groupby.indices gives integer row positions even though every timestamp is
+    # repeated across many stocks. All rows at a timestamp see the same threshold,
+    # and their scores enter history only after that timestamp has been decided.
+    for _, positions in data.groupby(level=0, sort=True).indices.items():
+        positions = np.asarray(positions, dtype=int)
+        group_scores = data.iloc[positions]["pred_net_4h"].to_numpy(dtype=float)
         if len(history) >= MIN_ROLLING_EVENT_HISTORY:
             threshold = float(np.quantile(np.fromiter(history, dtype=float), percentile))
-            idx = group.index
-            mask = group["pred_net_4h"].to_numpy(dtype=float) >= threshold
-            data.loc[idx, "causal_threshold"] = threshold
-            # duplicate timestamp index across symbols requires row-position-safe assignment
-            timestamp_rows = data.index == timestamp
-            row_positions = np.flatnonzero(timestamp_rows)
-            group_positions = row_positions[: len(group)]
-            selected_col = data.columns.get_loc("selected")
-            threshold_col = data.columns.get_loc("causal_threshold")
-            data.iloc[group_positions, threshold_col] = threshold
-            data.iloc[group_positions, selected_col] = mask
-        for score in group["pred_net_4h"].to_numpy(dtype=float):
+            data.iloc[positions, threshold_col] = threshold
+            data.iloc[positions, selected_col] = group_scores >= threshold
+        for score in group_scores:
             if np.isfinite(score):
                 history.append(float(score))
     return data
@@ -110,7 +109,9 @@ def simulate_execution(predictions: pd.DataFrame, percentile: float, *, friction
                 due = [p for p in open_positions if p.exit_time <= entry_time]
                 for position in sorted(due, key=lambda p: p.exit_time):
                     cash, trade, friction_cost = _finish(position, cash, friction)
-                    trades.append(trade); total_friction += friction_cost; open_positions.remove(position)
+                    trades.append(trade)
+                    total_friction += friction_cost
+                    open_positions.remove(position)
 
                 ranked = entry_group.sort_values("pred_net_4h", ascending=False)
                 for _, row in ranked.iterrows():
@@ -136,15 +137,21 @@ def simulate_execution(predictions: pd.DataFrame, percentile: float, *, friction
                     total_cost = trade_value + entry_commission
                     cash -= total_cost
                     open_positions.append(OpenPosition(
-                        symbol=symbol, shares=shares, entry_time=pd.Timestamp(entry_time),
-                        exit_time=pd.Timestamp(row["exit_time_4h"]), raw_entry_price=raw_entry,
-                        raw_exit_price=raw_exit, entry_fill=entry_fill, total_cost=total_cost,
+                        symbol=symbol,
+                        shares=shares,
+                        entry_time=pd.Timestamp(entry_time),
+                        exit_time=pd.Timestamp(row["exit_time_4h"]),
+                        raw_entry_price=raw_entry,
+                        raw_exit_price=raw_exit,
+                        entry_fill=entry_fill,
+                        total_cost=total_cost,
                         score=float(row["pred_net_4h"]),
                     ))
 
         for position in sorted(open_positions, key=lambda p: p.exit_time):
             cash, trade, friction_cost = _finish(position, cash, friction)
-            trades.append(trade); total_friction += friction_cost
+            trades.append(trade)
+            total_friction += friction_cost
         daily.append({"date": pd.Timestamp(session_date), "equity": cash})
 
     trades_frame = pd.DataFrame(trades)
@@ -153,7 +160,10 @@ def simulate_execution(predictions: pd.DataFrame, percentile: float, *, friction
         max_dd = sharpe = 0.0
         month_returns = pd.Series(dtype=float)
     else:
-        values = pd.concat([pd.Series([STARTING_CASH], index=[equity.index.min() - pd.Timedelta(days=1)]), equity["equity"]]).sort_index()
+        values = pd.concat([
+            pd.Series([STARTING_CASH], index=[equity.index.min() - pd.Timedelta(days=1)]),
+            equity["equity"],
+        ]).sort_index()
         daily_returns = values.pct_change().fillna(0.0).iloc[1:]
         max_dd = float((values / values.cummax() - 1).min())
         std = float(daily_returns.std(ddof=0))
@@ -168,11 +178,18 @@ def simulate_execution(predictions: pd.DataFrame, percentile: float, *, friction
         avg_trade = float(trades_frame["return"].mean())
     positive_months = int((month_returns > 0).sum()) if len(month_returns) else 0
     result = {
-        "percentile": float(percentile), "candidate_signals": int(len(candidates)),
-        "return": float(cash / STARTING_CASH - 1), "final_value": float(cash),
-        "trades": int(len(trades_frame)), "win_rate": win_rate, "profit_factor": pf,
-        "average_trade": avg_trade, "max_drawdown": max_dd, "daily_sharpe": sharpe,
-        "positive_months": positive_months, "month_count": int(len(month_returns)),
+        "percentile": float(percentile),
+        "candidate_signals": int(len(candidates)),
+        "return": float(cash / STARTING_CASH - 1),
+        "final_value": float(cash),
+        "trades": int(len(trades_frame)),
+        "win_rate": win_rate,
+        "profit_factor": pf,
+        "average_trade": avg_trade,
+        "max_drawdown": max_dd,
+        "daily_sharpe": sharpe,
+        "positive_months": positive_months,
+        "month_count": int(len(month_returns)),
         "positive_month_fraction": float(positive_months / len(month_returns)) if len(month_returns) else 0.0,
         "median_month": float(month_returns.median()) if len(month_returns) else 0.0,
         "worst_month": float(month_returns.min()) if len(month_returns) else 0.0,
@@ -185,16 +202,30 @@ def deployment_gate(selected: dict[str, Any], neighbors: list[dict[str, Any]]):
     local = [selected] + neighbors
     returns = [float(x["return"]) for x in local]
     pfs = [float(x["profit_factor"]) for x in local]
-    summary = {"median_return": float(np.median(returns)), "worst_return": float(np.min(returns)), "median_profit_factor": float(np.median(pfs))}
+    summary = {
+        "median_return": float(np.median(returns)),
+        "worst_return": float(np.min(returns)),
+        "median_profit_factor": float(np.median(pfs)),
+    }
     failures = []
-    if int(selected["trades"]) < MIN_TRADES_FOR_DEPLOYMENT: failures.append(f"fewer than {MIN_TRADES_FOR_DEPLOYMENT} completed trades")
-    if float(selected["return"]) <= 0: failures.append("after-cost return <= 0")
-    if float(selected["profit_factor"]) < 1.15: failures.append("profit factor < 1.15")
-    if float(selected["average_trade"]) <= 0: failures.append("average trade <= 0")
-    if float(selected["daily_sharpe"]) <= 0: failures.append("daily Sharpe <= 0")
-    if float(selected["positive_month_fraction"]) <= 0.55: failures.append("positive months <= 55%")
-    if len(neighbors) < 2: failures.append("selected percentile is a boundary / lacks two neighbors")
-    if summary["median_return"] <= 0: failures.append("local median return <= 0")
-    if summary["worst_return"] <= 0: failures.append("local worst return <= 0")
-    if summary["median_profit_factor"] < 1.05: failures.append("local median profit factor < 1.05")
+    if int(selected["trades"]) < MIN_TRADES_FOR_DEPLOYMENT:
+        failures.append(f"fewer than {MIN_TRADES_FOR_DEPLOYMENT} completed trades")
+    if float(selected["return"]) <= 0:
+        failures.append("after-cost return <= 0")
+    if float(selected["profit_factor"]) < 1.15:
+        failures.append("profit factor < 1.15")
+    if float(selected["average_trade"]) <= 0:
+        failures.append("average trade <= 0")
+    if float(selected["daily_sharpe"]) <= 0:
+        failures.append("daily Sharpe <= 0")
+    if float(selected["positive_month_fraction"]) <= 0.55:
+        failures.append("positive months <= 55%")
+    if len(neighbors) < 2:
+        failures.append("selected percentile is a boundary / lacks two neighbors")
+    if summary["median_return"] <= 0:
+        failures.append("local median return <= 0")
+    if summary["worst_return"] <= 0:
+        failures.append("local worst return <= 0")
+    if summary["median_profit_factor"] < 1.05:
+        failures.append("local median profit factor < 1.05")
     return not failures, failures, summary
