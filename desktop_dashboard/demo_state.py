@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from state import DEFAULT_STATE_PATH, write_state_atomic
+from .state import DEFAULT_STATE_PATH, write_state_atomic
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,7 +28,6 @@ def main() -> None:
 
     try:
         while True:
-            # Small deterministic/random walk solely for UI preview.
             drift = 0.45 + math.sin(step / 8.0) * 1.8
             noise = random.gauss(0.0, 5.5)
             portfolio_value = max(100.0, portfolio_value + drift + noise)
