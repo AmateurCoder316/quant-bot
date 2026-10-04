@@ -9,9 +9,12 @@ import sys
 import time
 from pathlib import Path
 
+from desktop_dashboard.control import load_control, write_control
+
 
 ROOT = Path(__file__).resolve().parent
 LIVE_STATE = ROOT / "live_state.json"
+CONTROL_FILE = ROOT / "bot_control.json"
 DASHBOARD_MODULE = "desktop_dashboard"
 TRADER_SCRIPT = ROOT / "paper_trader.py"
 DEMO_MODULE = "desktop_dashboard.demo_state"
@@ -81,12 +84,36 @@ def stop_process(process: subprocess.Popen | None, *, interrupt: bool = False) -
         pass
 
 
+def worker_command(args: argparse.Namespace) -> tuple[list[str], str, bool]:
+    if args.demo:
+        return (
+            [
+                sys.executable,
+                "-m",
+                DEMO_MODULE,
+                "--state",
+                str(LIVE_STATE),
+            ],
+            "dashboard demo feed",
+            False,
+        )
+
+    if not TRADER_SCRIPT.exists():
+        raise SystemExit(f"Missing trader: {TRADER_SCRIPT}")
+    return [sys.executable, str(TRADER_SCRIPT)], "paper trader", True
+
+
 def main() -> int:
     args = parse_args()
     check_dashboard_dependencies()
 
     dashboard = None
     worker = None
+    worker_needs_interrupt = False
+
+    # Every normal/demo launch starts in the running state. The button may then
+    # stop and restart the worker while keeping the dashboard alive.
+    write_control(CONTROL_FILE, not args.dashboard_only)
 
     try:
         dashboard = start_process(
@@ -96,6 +123,8 @@ def main() -> int:
                 DASHBOARD_MODULE,
                 "--state",
                 str(LIVE_STATE),
+                "--control",
+                str(CONTROL_FILE),
             ],
             name="desktop dashboard",
         )
@@ -103,29 +132,15 @@ def main() -> int:
         if args.dashboard_only:
             print("Desktop dashboard started.")
             print("Close the window or press Ctrl+C here to stop.")
-        elif args.demo:
-            worker = start_process(
-                [
-                    sys.executable,
-                    "-m",
-                    DEMO_MODULE,
-                    "--state",
-                    str(LIVE_STATE),
-                ],
-                name="dashboard demo feed",
-            )
-            print("Quant Bot dashboard demo started.")
-            print("Close the dashboard or press Ctrl+C here to stop.")
         else:
-            if not TRADER_SCRIPT.exists():
-                raise SystemExit(f"Missing trader: {TRADER_SCRIPT}")
-            worker = start_process(
-                [sys.executable, str(TRADER_SCRIPT)],
-                name="paper trader",
-            )
-            print("Quant Bot started.")
-            print("Paper trader + desktop dashboard are running.")
-            print("Close the dashboard or press Ctrl+C here to stop both.")
+            command, name, worker_needs_interrupt = worker_command(args)
+            worker = start_process(command, name=name)
+            if args.demo:
+                print("Quant Bot dashboard demo started.")
+            else:
+                print("Quant Bot started.")
+                print("Paper trader + desktop dashboard are running.")
+            print("Use Start/Stop in the dashboard or Ctrl+C here.")
 
         while True:
             if dashboard.poll() is not None:
@@ -134,17 +149,33 @@ def main() -> int:
                     print(f"Dashboard exited with code {return_code}.")
                 break
 
-            if worker is not None and worker.poll() is not None:
-                return_code = worker.returncode
-                print(f"Worker exited with code {return_code}.")
-                break
+            if not args.dashboard_only:
+                desired_running = load_control(CONTROL_FILE).running
+
+                if worker is not None and worker.poll() is not None:
+                    return_code = worker.returncode
+                    print(f"Worker exited with code {return_code}.")
+                    worker = None
+                    if desired_running:
+                        write_control(CONTROL_FILE, False)
+                        desired_running = False
+
+                if desired_running and worker is None:
+                    command, name, worker_needs_interrupt = worker_command(args)
+                    worker = start_process(command, name=name)
+                    print(f"{name.capitalize()} started.")
+                elif not desired_running and worker is not None:
+                    stop_process(worker, interrupt=worker_needs_interrupt)
+                    worker = None
+                    print("Worker stopped. Dashboard remains open.")
 
             time.sleep(0.25)
 
     except KeyboardInterrupt:
         print("\nStopping Quant Bot...")
     finally:
-        stop_process(worker, interrupt=not args.demo)
+        write_control(CONTROL_FILE, False)
+        stop_process(worker, interrupt=worker_needs_interrupt)
         stop_process(dashboard)
 
     return 0
