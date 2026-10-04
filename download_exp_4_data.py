@@ -7,10 +7,17 @@ from datetime import date
 
 import pandas as pd
 import requests
+from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from exp4_config import ALL_SYMBOLS, LEGACY_5M_DIR, SOURCE_5M_DIR
+
+
+# Load a repo-local .env automatically while preserving any variables already
+# exported in the shell. This keeps credentials out of source code and avoids
+# requiring a manual `set -x`/`export` every new terminal session.
+load_dotenv(override=False)
 
 BASE_URL = "https://data.alpaca.markets/v2/stocks/{symbol}/bars"
 TIMEFRAME = "5Min"
@@ -26,7 +33,10 @@ def credentials() -> tuple[str, str]:
     key = os.getenv("APCA_API_KEY_ID")
     secret = os.getenv("APCA_API_SECRET_KEY")
     if not key or not secret:
-        raise RuntimeError("Set APCA_API_KEY_ID and APCA_API_SECRET_KEY in your shell/.env loader.")
+        raise RuntimeError(
+            "Missing Alpaca credentials. Add APCA_API_KEY_ID and "
+            "APCA_API_SECRET_KEY to the repo .env file or export them in your shell."
+        )
     return key, secret
 
 
